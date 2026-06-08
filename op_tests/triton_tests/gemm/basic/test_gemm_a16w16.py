@@ -98,16 +98,11 @@ def get_x_vals():
 
 def run_gemm(x, w, bias, out_dtype, y, backend, activation=None, kernel_type="basic"):
     """Unified GEMM runner dispatching via the backend parameter."""
-    if isinstance(out_dtype, tuple):
-        dtype_arg = out_dtype
-    else:
-        dtype_arg = out_dtype
-
     return gemm_a16w16(
         x,
         w,
         bias=bias,
-        dtype=dtype_arg,
+        dtype=out_dtype,
         y=y,
         activation=activation,
         backend=backend,

@@ -1402,7 +1402,8 @@ def _gemm_a16w16_v9_kernel(
     # TDM tensor descriptors. The block (M, N) offset is baked into the base
     # pointer and the descriptor bounds are set to the remaining extent so the
     # TDM engine zero-fills partial tiles at the matrix edge (N may not be a
-    # multiple of BLOCK_N). K is padded on the host so it is never partial.
+    # multiple of BLOCK_N). The K bound is likewise refreshed each advance (see
+    # set_bounds below), so K need not be a multiple of BLOCK_K either.
     m_rem = M - pid_m * BLOCK_M
     n_rem = N - pid_n * BLOCK_N
     a_top_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -1444,8 +1445,21 @@ def _gemm_a16w16_v9_kernel(
     acc_tr = gl.zeros((HALF_M, HALF_N), gl.float32, wmmaLayout)
     acc_br = gl.zeros((HALF_M, HALF_N), gl.float32, wmmaLayout)
 
-    iterMax = gl.cdiv(K, BLOCK_K)
+    # Round the K-tile count up to an even number so the 2x-unrolled main loop
+    # and the 2-tile peeled epilogue stay balanced. When K is not a multiple of
+    # 2*BLOCK_K this over-iterates by one tile; that tile (and any genuinely
+    # partial last tile) is masked/zero-filled via the per-advance set_bounds
+    # below, so K needs no host-side padding.
+    iterMax = 2 * gl.cdiv(K, 2 * BLOCK_K)
     gl.assume(iterMax > 4)
+
+    # Per-descriptor dim-0 bounds are constant across the K loop; the K (dim-1)
+    # bound is refreshed to the remaining extent (K - k_off) on every advance so
+    # the TDM engine zero-fills any K tile past the true K.
+    a_top_bound0 = m_rem
+    a_bot_bound0 = m_rem - HALF_M
+    b_left_bound0 = n_rem
+    b_right_bound0 = n_rem - HALF_N
 
     # Prologue: TDM tiles 0,1; LR 2 sub-tiles from buf 0.
     # TDM order: B_left, A_top, A_bot, B_right.
@@ -1454,10 +1468,10 @@ def _gemm_a16w16_v9_kernel(
     gl.amd.gfx1250.tdm.async_load(a_bot_desc, [0, 0], smemA_bot.index(0))
     gl.amd.gfx1250.tdm.async_load(b_right_desc, [0, 0], smemB_right.index(0))
 
-    b_left_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_left_desc, add_offsets=[0, BLOCK_K])
-    a_top_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_top_desc, add_offsets=[0, BLOCK_K])
-    a_bot_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_bot_desc, add_offsets=[0, BLOCK_K])
-    b_right_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_right_desc, add_offsets=[0, BLOCK_K])
+    b_left_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_left_desc, add_offsets=[0, BLOCK_K], set_bounds=[b_left_bound0, K - BLOCK_K])
+    a_top_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_top_desc, add_offsets=[0, BLOCK_K], set_bounds=[a_top_bound0, K - BLOCK_K])
+    a_bot_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_bot_desc, add_offsets=[0, BLOCK_K], set_bounds=[a_bot_bound0, K - BLOCK_K])
+    b_right_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_right_desc, add_offsets=[0, BLOCK_K], set_bounds=[b_right_bound0, K - BLOCK_K])
 
     gl.amd.gfx1250.tdm.async_load(b_left_desc, [0, 0], smemB_left.index(1))
     gl.amd.gfx1250.tdm.async_load(a_top_desc, [0, 0], smemA_top.index(1))
@@ -1476,50 +1490,50 @@ def _gemm_a16w16_v9_kernel(
     for k in range(0, iterMax - 3, 2):
         # --- Even half: TDM loads -> buf 0 ---
         acc_tl = gl.amd.gfx1250.wmma(a_top_reg, b_left_reg, acc_tl)
-        b_left_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_left_desc, add_offsets=[0, BLOCK_K])
+        b_left_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_left_desc, add_offsets=[0, BLOCK_K], set_bounds=[b_left_bound0, K - (k + 2) * BLOCK_K])
         gl.amd.gfx1250.tdm.async_load(b_left_desc, [0, 0], smemB_left.index(0))
         gl.amd.gfx1250.tdm.async_wait(6)
         a_bot_reg = smemA_bot.index(0).load(layout=dotOpLayoutA)
 
         acc_bl = gl.amd.gfx1250.wmma(a_bot_reg, b_left_reg, acc_bl)
-        a_top_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_top_desc, add_offsets=[0, BLOCK_K])
+        a_top_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_top_desc, add_offsets=[0, BLOCK_K], set_bounds=[a_top_bound0, K - (k + 2) * BLOCK_K])
         gl.amd.gfx1250.tdm.async_load(a_top_desc, [0, 0], smemA_top.index(0))
         gl.amd.gfx1250.tdm.async_wait(6)
         b_right_reg = smemB_right.index(0).permute([1, 0]).load(layout=dotOpLayoutB)
 
         acc_tr = gl.amd.gfx1250.wmma(a_top_reg, b_right_reg, acc_tr)
-        a_bot_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_bot_desc, add_offsets=[0, BLOCK_K])
+        a_bot_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_bot_desc, add_offsets=[0, BLOCK_K], set_bounds=[a_bot_bound0, K - (k + 2) * BLOCK_K])
         gl.amd.gfx1250.tdm.async_load(a_bot_desc, [0, 0], smemA_bot.index(0))
         gl.amd.gfx1250.tdm.async_wait(6)
         b_left_reg = smemB_left.index(1).permute([1, 0]).load(layout=dotOpLayoutB)
 
         acc_br = gl.amd.gfx1250.wmma(a_bot_reg, b_right_reg, acc_br)
-        b_right_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_right_desc, add_offsets=[0, BLOCK_K])
+        b_right_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_right_desc, add_offsets=[0, BLOCK_K], set_bounds=[b_right_bound0, K - (k + 2) * BLOCK_K])
         gl.amd.gfx1250.tdm.async_load(b_right_desc, [0, 0], smemB_right.index(0))
         gl.amd.gfx1250.tdm.async_wait(6)
         a_top_reg = smemA_top.index(1).load(layout=dotOpLayoutA)
 
         # --- Odd half: TDM loads -> buf 1 ---
         acc_tl = gl.amd.gfx1250.wmma(a_top_reg, b_left_reg, acc_tl)
-        b_left_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_left_desc, add_offsets=[0, BLOCK_K])
+        b_left_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_left_desc, add_offsets=[0, BLOCK_K], set_bounds=[b_left_bound0, K - (k + 3) * BLOCK_K])
         gl.amd.gfx1250.tdm.async_load(b_left_desc, [0, 0], smemB_left.index(1))
         gl.amd.gfx1250.tdm.async_wait(6)
         a_bot_reg = smemA_bot.index(1).load(layout=dotOpLayoutA)
 
         acc_bl = gl.amd.gfx1250.wmma(a_bot_reg, b_left_reg, acc_bl)
-        a_top_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_top_desc, add_offsets=[0, BLOCK_K])
+        a_top_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_top_desc, add_offsets=[0, BLOCK_K], set_bounds=[a_top_bound0, K - (k + 3) * BLOCK_K])
         gl.amd.gfx1250.tdm.async_load(a_top_desc, [0, 0], smemA_top.index(1))
         gl.amd.gfx1250.tdm.async_wait(6)
         b_right_reg = smemB_right.index(1).permute([1, 0]).load(layout=dotOpLayoutB)
 
         acc_tr = gl.amd.gfx1250.wmma(a_top_reg, b_right_reg, acc_tr)
-        a_bot_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_bot_desc, add_offsets=[0, BLOCK_K])
+        a_bot_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_bot_desc, add_offsets=[0, BLOCK_K], set_bounds=[a_bot_bound0, K - (k + 3) * BLOCK_K])
         gl.amd.gfx1250.tdm.async_load(a_bot_desc, [0, 0], smemA_bot.index(1))
         gl.amd.gfx1250.tdm.async_wait(6)
         b_left_reg = smemB_left.index(0).permute([1, 0]).load(layout=dotOpLayoutB)
 
         acc_br = gl.amd.gfx1250.wmma(a_bot_reg, b_right_reg, acc_br)
-        b_right_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_right_desc, add_offsets=[0, BLOCK_K])
+        b_right_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(b_right_desc, add_offsets=[0, BLOCK_K], set_bounds=[b_right_bound0, K - (k + 3) * BLOCK_K])
         gl.amd.gfx1250.tdm.async_load(b_right_desc, [0, 0], smemB_right.index(1))
         gl.amd.gfx1250.tdm.async_wait(6)
         a_top_reg = smemA_top.index(0).load(layout=dotOpLayoutA)
@@ -1681,10 +1695,11 @@ def _gemm_a16w16_v9(
 ):
     """Host wrapper for the v9 2x2-sliced kernel (large compute-bound shapes).
 
-    Forces the kernel's fixed tiling (256x256x64, num_warps=4), pads K to a
-    multiple of 2*BLOCK_K, and requires the standard AITER A16W16 layout: x
-    row-major (M, K) and w row-major (N, K) so that, after ``w = w.T``, both A
-    and B are K-contiguous. Bias and activation are not supported.
+    Forces the kernel's fixed tiling (256x256x64, num_warps=4) and requires the
+    standard AITER A16W16 layout: x row-major (M, K) and w row-major (N, K) so
+    that, after ``w = w.T``, both A and B are K-contiguous. M, N and K may be
+    arbitrary (partial tiles are masked/zero-filled inside the kernel); no
+    host-side padding is performed. Bias and activation are not supported.
     """
     M, K = x.shape
     N, _ = w.shape
@@ -1692,23 +1707,17 @@ def _gemm_a16w16_v9(
     BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
     num_warps = 4
 
-    # The K loop is unrolled by 2 and the epilogue peels the last two K tiles,
-    # so iterMax = K / BLOCK_K must be even (K divisible by 2*BLOCK_K) and > 4.
-    K_mult = 2 * BLOCK_K
-    K_padded = triton.cdiv(K, K_mult) * K_mult
-    if K_padded != K:
-        x = torch.nn.functional.pad(x, (0, K_padded - K))
-        w = torch.nn.functional.pad(w, (0, K_padded - K))
-        K = K_padded
-
+    # Partial M, N and K tiles are all handled inside the kernel: the TDM load
+    # descriptors zero-fill OOB rows/columns (the K bound is refreshed each
+    # advance) and the store descriptor masks OOB rows/columns against its
+    # (m_rem, n_rem) bounds. So none of M, N, K need to be a multiple of the
+    # block size and no host-side padding/reallocation is required. The kernel
+    # rounds the K-tile count up to even internally; it only needs enough tiles
+    # to fill the 2x-unrolled pipeline + 2-tile epilogue (iterMax > 4).
     assert (
-        K // BLOCK_K
-    ) > 4, f"v9 kernel requires K/{BLOCK_K} > 4 (got K={K}); use kernel_type='basic' for small K"
+        2 * triton.cdiv(K, 2 * BLOCK_K)
+    ) > 4, f"v9 kernel requires more K tiles (got K={K}); use kernel_type='basic' for small K"
 
-    # Partial M and N tiles are handled inside the kernel: the TDM load
-    # descriptors zero-fill OOB rows/columns and the store descriptor masks OOB
-    # rows/columns against its (m_rem, n_rem) bounds, so neither M nor N needs to
-    # be a multiple of the block size.
     w = w.T  # (K, N)
 
     assert (
