@@ -52,6 +52,16 @@ from aiter.ops.shuffle import shuffle_weight  # noqa: E402
 from aiter.utility import fp4_utils  # noqa: E402
 from aiter.utility import dtypes  # noqa: E402
 
+# Gluon (Triton) a8w4 MoE path: same public dispatcher used by
+# bench_moe_gemm_a8w4.py / test_moe_gemm_a8w4.py. On gfx1250 ``moe_gemm_a8w4``
+# auto-selects the gluon kernels (``use_gluon = get_arch() == 'gfx1250'``).
+from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (  # noqa: E402
+    moe_gemm_a8w4,
+    swizzle_scales_gfx1250,
+)
+from aiter.ops.triton.moe.moe_routing.routing import routing  # noqa: E402
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp  # noqa: E402
+
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
 SCALE_BLOCK = 32
@@ -527,6 +537,346 @@ def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Gluon (Triton) vs FlyDSL end-to-end comparison harness
+#
+# Both paths run a full two-stage MoE MLP (sort/dispatch + 2 GEMMs + reduce)
+# in the a8w4 contract: per-1x32 MXFP8 activations x MXFP4 weights. They are
+# distinct implementations with different dispatch/reduce, so only an
+# end-to-end comparison is fair (a single-GEMM compare is impossible: the
+# Gluon GEMM fuses token-gather via gather_indx, FlyDSL reads pre-grouped
+# (E, max_m, dim) buffers).
+#
+# Routing is the single source of truth: ``routing(logits)`` builds the Gluon
+# RoutingData + gather/scatter, and the SAME logits feed the FlyDSL path and
+# the shared torch ref via ``_topk_from_logits`` so all three see identical
+# expert assignment + combine weights.
+#
+# SwiGLU parity: aiter.fused_moe.swiglu (used by the ref's torch_moe_stage1)
+# and the gluon kernel _swiglu compute the same formula
+# ``gate*sigmoid(alpha*gate)*(up+1)`` with alpha=1.702 and clamp=limit. They
+# differ ONLY in gate/up ordering -- the ref splits contiguous halves (GGUU),
+# the gluon kernel splits interleaved (GUGU) -- so the Gluon stage1 weight is
+# row-permuted GGUU->GUGU via ``_gguu_to_gugu_rows`` to make all three agree.
+# ---------------------------------------------------------------------------
+SWIGLU_ALPHA = 1.702
+
+
+def _topk_from_logits(
+    logits: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Derive (topk_ids int32, topk_weight bf16) matching ``routing()``.
+
+    The Triton ``routing`` flat path applies softmax over all experts then
+    top-k WITHOUT renorm (topk default renorm=False). We mirror that exactly
+    so the FlyDSL path + torch ref combine with the same per-route weights the
+    Gluon path uses via ``rdata.gate_scal``.
+    """
+    probs = torch.softmax(logits.float(), dim=-1)
+    weight, ids = torch.topk(probs, topk, dim=-1)
+    return ids.to(torch.int32), weight.to(torch.bfloat16)
+
+
+def _build_shared_inputs(
+    *,
+    experts: int,
+    tokens: int,
+    topk: int,
+    model_dim: int,
+    inter_dim: int,
+    use_bias: bool = True,
+    seed: int = 0,
+):
+    """Build one bf16 master weight set + logits shared by all three consumers.
+
+    Returns a dict with bf16 masters (GGUU logical), the canonical MXFP4 bytes
+    + raw e8m0 scales (from ``downcast_to_mxfp``) reused by every consumer to
+    avoid quantization-rounding divergence, biases, hidden, and logits.
+    """
+    K = model_dim
+    inter = inter_dim
+    dev = "cuda"
+
+    wg = torch.Generator(device="cpu").manual_seed(seed + 17)
+    # Logical GGUU bf16 masters: w1 (E, 2*inter, K), w2 (E, K, inter).
+    w1_bf16 = (torch.randn((experts, 2 * inter, K), generator=wg) * 0.1).to(
+        torch.bfloat16
+    )
+    w2_bf16 = (torch.randn((experts, K, inter), generator=wg) * 0.1).to(torch.bfloat16)
+
+    # Canonical MXFP4 quantization, quantized along the K (contraction) axis.
+    # These exact bytes/scales feed the FlyDSL path and the torch ref so they
+    # decode identical weights; the Gluon path re-derives from the same bf16
+    # master in its own (E, K, N) orientation (deterministic -> same codes).
+    w1_bytes, w1_scale_raw = downcast_to_mxfp(w1_bf16.cuda(), torch.uint8, axis=-1)
+    w2_bytes, w2_scale_raw = downcast_to_mxfp(w2_bf16.cuda(), torch.uint8, axis=-1)
+    w1_bytes = w1_bytes.contiguous()
+    w2_bytes = w2_bytes.contiguous()
+    w1_scale_raw = w1_scale_raw.contiguous().view(torch.uint8)
+    w2_scale_raw = w2_scale_raw.contiguous().view(torch.uint8)
+
+    if use_bias:
+        bg = torch.Generator(device="cpu").manual_seed(seed + 91)
+        bias1 = (torch.randn((experts, 2 * inter), generator=bg) * 1e-3).float()
+        bias2 = (torch.randn((experts, K), generator=bg) * 1e-3).float()
+    else:
+        bias1 = torch.zeros((experts, 2 * inter))
+        bias2 = torch.zeros((experts, K))
+
+    hg = torch.Generator(device="cpu").manual_seed(seed + 123)
+    hidden = (torch.randn((tokens, K), generator=hg) * 0.5).to(torch.bfloat16)
+
+    lg = torch.Generator(device="cpu").manual_seed(seed + 251)
+    logits = torch.randn((tokens, experts), generator=lg).float()
+
+    return {
+        "w1_bf16": w1_bf16,
+        "w2_bf16": w2_bf16,
+        "w1_bytes": w1_bytes,
+        "w2_bytes": w2_bytes,
+        "w1_scale_raw": w1_scale_raw,
+        "w2_scale_raw": w2_scale_raw,
+        "bias1": bias1.cuda(),
+        "bias2": bias2.cuda(),
+        "hidden": hidden.cuda(),
+        "logits": logits.cuda(),
+        "experts": experts,
+        "tokens": tokens,
+        "topk": topk,
+        "model_dim": K,
+        "inter_dim": inter,
+    }
+
+
+def _build_gluon_thunk(
+    shared: dict,
+    *,
+    activation: ActivationType,
+    swiglu_limit: float,
+):
+    """Build a zero-arg thunk that runs the full Gluon mx8 MoE MLP.
+
+    Routing (rdata + gather/scatter) and the GUGU-permuted MXFP4 stage1 weight
+    are prepared ONCE; the returned thunk only re-runs the two GEMMs + reduce
+    so ``run_perftest`` times the compute, not the one-off prep.
+    """
+    K = shared["model_dim"]
+    inter = shared["inter_dim"]
+    topk = shared["topk"]
+    apply_swiglu = activation == ActivationType.Swiglu
+
+    rdata, gather_indx, scatter_indx = routing(shared["logits"], topk)
+
+    fp8_dtype = torch.float8_e4m3fn
+
+    # Stage1 weight: Gluon wants (E, K_out_rows, K) packed MXFP4 quantized along
+    # K. Re-derive from the bf16 master in GUGU row order so the kernel's
+    # interleaved _swiglu split lines up with the ref's contiguous-half split.
+    w1_bf16_gugu = _gguu_to_gugu_rows(shared["w1_bf16"]).cuda()
+    bias1_gugu = _gguu_to_gugu_rows(shared["bias1"].cpu()).cuda()
+    w1_g_bytes, w1_g_scale = downcast_to_mxfp(w1_bf16_gugu, torch.uint8, axis=-1)
+    w2_g_bytes, w2_g_scale = downcast_to_mxfp(shared["w2_bf16"].cuda(), torch.uint8, axis=-1)
+    w1_g_scale = swizzle_scales_gfx1250(w1_g_scale)
+    w2_g_scale = swizzle_scales_gfx1250(w2_g_scale)
+
+    hidden = shared["hidden"]
+
+    def _run():
+        # Stage1: per-1x32 MXFP8 activations.
+        x_q, x_s = downcast_to_mxfp(hidden, fp8_dtype, axis=-1)
+        a2 = moe_gemm_a8w4(
+            x_q,
+            w1_g_bytes,
+            x_s,
+            w1_g_scale,
+            None,
+            None,
+            bias1_gugu,
+            rdata,
+            gather_indx=gather_indx,
+            swizzle_mx_scale="GFX1250_SCALE",
+            apply_swiglu=apply_swiglu,
+            alpha=SWIGLU_ALPHA,
+            limit=swiglu_limit,
+            swiglu_add_residual=True,
+        )
+        # Stage2: re-quant intermediate to MXFP8, combine via scatter+reduce
+        # weighted by the routing gate (gammas), matching ref doweight=True.
+        a2_q, a2_s = downcast_to_mxfp(a2, fp8_dtype, axis=-1)
+        out = moe_gemm_a8w4(
+            a2_q,
+            w2_g_bytes,
+            a2_s,
+            w2_g_scale,
+            None,
+            None,
+            shared["bias2"],
+            rdata,
+            scatter_indx=scatter_indx,
+            gammas=rdata.gate_scal,
+            swizzle_mx_scale="GFX1250_SCALE",
+        )
+        return out
+
+    return _run
+
+
+def _torch_ref_from_shared(
+    shared: dict,
+    *,
+    activation: ActivationType,
+    swiglu_limit: float,
+) -> torch.Tensor:
+    """Run the shared fp32 two-stage MoE ref from the GGUU logical weights."""
+    topk_id, topk_w = _topk_from_logits(shared["logits"], shared["topk"])
+    return _torch_moe_ref(
+        shared["hidden"],
+        shared["w1_bytes"],
+        shared["w1_scale_raw"],
+        shared["bias1"],
+        shared["w2_bytes"],
+        shared["w2_scale_raw"],
+        shared["bias2"],
+        topk_w,
+        topk_id,
+        data_format="a8w4",
+        activation=activation,
+        swiglu_limit=swiglu_limit,
+    )
+
+
+def _build_flydsl_thunk(
+    shared: dict,
+    *,
+    activation: ActivationType,
+    swiglu_limit: float,
+):
+    """Zero-arg thunk running the FlyDSL grouped path from shared inputs.
+
+    Reuses the same MXFP4 weight bytes + raw scales as the ref, prepped into
+    the grouped layout (shuffle_weight + grouped scale) once.
+    """
+    experts = shared["experts"]
+    K = shared["model_dim"]
+    inter = shared["inter_dim"]
+
+    topk_id, topk_w = _topk_from_logits(shared["logits"], shared["topk"])
+
+    # GGUU -> SEPARATED grouped prep (mirrors _run_grouped_via_fused_moe).
+    w1_grouped = shuffle_weight(shared["w1_bytes"].cpu(), layout=(16, 16)).cuda()
+    w2_grouped = shuffle_weight(shared["w2_bytes"].cpu(), layout=(16, 16)).cuda()
+    w1_scale = _grouped_scale(
+        shared["w1_scale_raw"].cpu(), experts=experts, rows=2 * inter, k_dim=K
+    )
+    w2_scale = _grouped_scale(
+        shared["w2_scale_raw"].cpu(), experts=experts, rows=K, k_dim=inter
+    )
+
+    fused_case = {
+        "hidden_states": shared["hidden"],
+        "w1": w1_grouped,
+        "w2": w2_grouped,
+        "topk_weight": topk_w.cuda(),
+        "topk_ids": topk_id.cuda(),
+        "activation": activation,
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "bias1": shared["bias1"],
+        "bias2": shared["bias2"],
+        "gate_mode": GateMode.SEPARATED.value,
+        "swiglu_limit": swiglu_limit,
+    }
+
+    def _run():
+        saved = os.environ.get("AITER_USE_GROUPED_GEMM")
+        os.environ["AITER_USE_GROUPED_GEMM"] = "1"
+        try:
+            return _invoke_grouped_fused_moe(fused_case)
+        finally:
+            if saved is None:
+                os.environ.pop("AITER_USE_GROUPED_GEMM", None)
+            else:
+                os.environ["AITER_USE_GROUPED_GEMM"] = saved
+
+    return _run
+
+
+def _compare_gluon_vs_flydsl(
+    *,
+    experts: int,
+    tokens: int,
+    topk: int,
+    model_dim: int,
+    inter_dim: int,
+    activation: ActivationType,
+    swiglu_limit: float,
+    use_bias: bool,
+    warmup: int,
+    iters: int,
+    seed: int = 0,
+) -> None:
+    """End-to-end Gluon vs FlyDSL: shared routing/weights, rel_l2 + timing."""
+    from aiter.test_common import run_perftest
+
+    _require_gfx1250()
+    act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    print(
+        f"[compare] E={experts} T={tokens} topk={topk} K={model_dim} "
+        f"I={inter_dim} act={act} swiglu_limit={swiglu_limit} "
+        f"bias={use_bias} warmup={warmup} iters={iters}",
+        flush=True,
+    )
+
+    shared = _build_shared_inputs(
+        experts=experts,
+        tokens=tokens,
+        topk=topk,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        use_bias=use_bias,
+        seed=seed,
+    )
+
+    gluon_thunk = _build_gluon_thunk(
+        shared, activation=activation, swiglu_limit=swiglu_limit
+    )
+    flydsl_thunk = _build_flydsl_thunk(
+        shared, activation=activation, swiglu_limit=swiglu_limit
+    )
+    ref = _torch_ref_from_shared(
+        shared, activation=activation, swiglu_limit=swiglu_limit
+    )
+
+    gluon_out = gluon_thunk().to(torch.bfloat16)
+    flydsl_out = flydsl_thunk().to(torch.bfloat16)
+    ref = ref.to(torch.bfloat16)
+    torch.cuda.synchronize()
+
+    rel_gluon = _rel_l2(gluon_out, ref)
+    rel_flydsl = _rel_l2(flydsl_out, ref)
+    rel_cross = _rel_l2(gluon_out, flydsl_out)
+    print(
+        f"[compare] rel_l2 gluon-vs-ref={rel_gluon:.4e} "
+        f"flydsl-vs-ref={rel_flydsl:.4e} gluon-vs-flydsl={rel_cross:.4e}",
+        flush=True,
+    )
+    print(
+        f"[compare] norms gluon={float(gluon_out.float().norm()):.4e} "
+        f"flydsl={float(flydsl_out.float().norm()):.4e} "
+        f"ref={float(ref.float().norm()):.4e}",
+        flush=True,
+    )
+
+    _, gluon_us = run_perftest(gluon_thunk, num_warmup=warmup, num_iters=iters)
+    _, flydsl_us = run_perftest(flydsl_thunk, num_warmup=warmup, num_iters=iters)
+    speedup = flydsl_us / gluon_us if gluon_us else float("nan")
+    print(
+        f"[compare] end-to-end us  gluon={gluon_us:.2f}  flydsl={flydsl_us:.2f}  "
+        f"(flydsl/gluon={speedup:.3f})",
+        flush=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pytest correctness suite
 # ---------------------------------------------------------------------------
 def _sanity_check(
@@ -643,7 +993,9 @@ def _bench(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=("bench", "verify"), default="bench")
+    parser.add_argument(
+        "--scenario", choices=("bench", "verify", "compare"), default="bench"
+    )
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
     parser.add_argument(
         "--layout",
@@ -709,6 +1061,28 @@ def main() -> None:
             swiglu_limit=args.swiglu_limit,
             use_bias=not args.no_bias,
             all_ones=args.all_ones,
+        )
+        return
+    if args.scenario == "compare":
+        if args.data_format != "a8w4":
+            raise SystemExit(
+                "--scenario compare only supports --data-format a8w4 "
+                "(Gluon mx8 path is per-1x32 MXFP8 x MXFP4)."
+            )
+        activation = (
+            ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
+        )
+        _compare_gluon_vs_flydsl(
+            experts=args.experts,
+            tokens=args.tokens,
+            topk=args.topk,
+            model_dim=args.model_dim,
+            inter_dim=args.inter_dim,
+            activation=activation,
+            swiglu_limit=args.swiglu_limit,
+            use_bias=not args.no_bias,
+            warmup=args.warmup,
+            iters=args.iters,
         )
         return
     _bench(args)
