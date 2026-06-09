@@ -72,14 +72,14 @@ SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
 
 
 def _ptr_view_safe(t: torch.Tensor):
-    # Prefer from_dlpack here because this launcher consumes shaped TensorAdaptors
-    # (AOT kernels use the TensorAdaptor's bare-pointer convention). Use
-    # flyc.from_c_void_p instead for kernels whose signature is `fx.Pointer`
-    # and call `fx.ptrtoint` directly (see _ptr_arg_safe in moe_kernels.py).
+    # Real tensors go through from_dlpack so the launcher sees a shaped
+    # TensorAdaptor. FakeTensors (AOT trace) get a null PointerAdaptor:
+    # raw pointer satisfies both fx.Pointer and fx.Tensor slots and avoids
+    # CUDA-initialising the parent process before forking AOT workers.
     type_name = type(t).__name__
     module_name = type(t).__module__
     if type_name == "FakeTensor" or "fake_tensor" in module_name:
-        return flyc.from_dlpack(torch.empty(1, dtype=torch.uint8, device="cuda"))
+        return flyc.from_c_void_p(fx.Uint8, 0)
     return flyc.from_dlpack(t)
 
 
