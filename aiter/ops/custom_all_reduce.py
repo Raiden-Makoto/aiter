@@ -76,6 +76,7 @@ def fused_allreduce_rmsnorm(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
+    weight_bias: float = 0.0,
 ) -> None: ...
 
 
@@ -91,6 +92,7 @@ def fused_allreduce_rmsnorm_pad(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
+    weight_bias: float = 0.0,
 ) -> None: ...
 
 
