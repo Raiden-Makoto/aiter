@@ -1686,6 +1686,46 @@ _KERNEL_MIN_BUFFERS = {
 # single variant regardless of shape.
 _ZERO_FILL_SAFE_KERNELS = {"lds_pipeline"}
 
+# M above this threshold is treated as compute-bound and routed to v9.
+COMPUTE_BOUND_M_THRESHOLD = 512
+
+_V9_BLOCK_K = 64
+
+
+def _v9_eligible(K: int) -> bool:
+    """Return True when K is large enough for the v9 kernel."""
+    return (2 * triton.cdiv(K, 2 * _V9_BLOCK_K)) > 4
+
+
+def select_gemm_a16w16_kernel(
+    M: int,
+    N: int,
+    K: int,
+    *,
+    bias: Optional[torch.Tensor] = None,
+    activation: Optional[str] = None,
+    config: Optional[Dict] = None,
+) -> tuple[str, Optional[Dict]]:
+    """Pick (kernel_type, config) for the gpt-oss regime split.
+
+    Compute-bound shapes (M > 512) without bias/activation use v9. Memory-bound
+    shapes use the basic kernel with NUM_BUFFERS=2 and block sizes from tuned
+    gfx1250 GEMM-A16W16 JSON configs.
+    """
+    if (
+        M > COMPUTE_BOUND_M_THRESHOLD
+        and bias is None
+        and activation is None
+        and _v9_eligible(K)
+    ):
+        return "v9", None
+
+    tuned_config, _ = _get_config(M, N, K)
+    tuned_config["NUM_BUFFERS"] = 2
+    if config is not None:
+        tuned_config.update(config)
+    return "basic", tuned_config
+
 
 def _gemm_a16w16_v9(
     x: torch.Tensor,
@@ -1766,7 +1806,7 @@ def gemm_a16w16_gfx1250(
     y: Optional[torch.Tensor] = None,
     config: Optional[Dict] = None,
     activation: Optional[str] = None,
-    kernel_type: str = "basic",
+    kernel_type: str = "auto",
 ):
     """
     Compute 16 bit gemm y = x @ w^T + bias using gluon (gfx1250).
@@ -1785,7 +1825,11 @@ def gemm_a16w16_gfx1250(
             - num_warps: Warps per block (default: 8)
         activation: Activation function ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu")
         kernel_type: Kernel variant to use:
-            - "basic": Simple pipelining with async TDM loads (default)
+            - "auto": Regime-aware dispatch (default) — v9 when M > 512
+              (compute-bound), otherwise basic with NUM_BUFFERS=2 using tuned
+              JSON block sizes. Falls back to basic when bias/activation are set
+              or K is too small for v9.
+            - "basic": Simple pipelining with async TDM loads
             - "warp_priority": Warp priority pipelining (requires NUM_BUFFERS >= 3)
             - "k_subtiling": K-dimension subtiling for LDS latency hiding (requires BLOCK_K >= 64)
             - "lds_pipeline": Manually pipelines LDS loads across K-tiles; places
@@ -1802,9 +1846,10 @@ def gemm_a16w16_gfx1250(
         Output tensor of shape (M, N)
     """
 
-    assert (
-        kernel_type in _KERNEL_MAP
-    ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
+    assert kernel_type in _KERNEL_MAP or kernel_type == "auto", (
+        f"Unknown kernel_type '{kernel_type}', must be one of "
+        f"{list(_KERNEL_MAP.keys()) + ['auto']}"
+    )
 
     _LOGGER.info(
         f"GEMM_A16W16 [gluon/gfx1250]: x={tuple(x.shape)} w={tuple(w.shape)} kernel={kernel_type}"
@@ -1820,13 +1865,18 @@ def gemm_a16w16_gfx1250(
     ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
     assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
 
+    M, K = x.shape
+    N, _ = w.shape
+
+    if kernel_type == "auto":
+        kernel_type, config = select_gemm_a16w16_kernel(
+            M, N, K, bias=bias, activation=activation, config=config
+        )
+
     if kernel_type == "v9":
         assert bias is None, "v9 kernel does not support bias"
         assert activation is None, "v9 kernel does not support activation"
         return _gemm_a16w16_v9(x, w, dtype, y)
-
-    M, K = x.shape
-    N, _ = w.shape
 
     if config is None:
         config, _ = _get_config(M, N, K)

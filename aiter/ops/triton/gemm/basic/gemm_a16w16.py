@@ -152,7 +152,7 @@ def _gemm_a16w16_gluon(
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
     activation: Optional[str] = None,
-    kernel_type: str = "basic",
+    kernel_type: str = "auto",
 ):
     """Gluon backend implementation of A16W16 GEMM (gfx1250)."""
     from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_a16w16_gfx1250 import (
@@ -180,7 +180,7 @@ def gemm_a16w16(
     config: Optional[dict] = None,
     activation: Optional[str] = None,
     skip_reduce: Optional[bool] = False,
-    kernel_type: str = "basic",
+    kernel_type: str = "auto",
     backend: Optional[str] = None,
 ):
     """
@@ -201,9 +201,11 @@ def gemm_a16w16(
             "silu_exp2", "relu").
         skip_reduce (Optional[bool]): [triton only] Skip reduction of split-K partial
             results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
-        kernel_type (str): [gluon only] Kernel variant ("basic", "warp_priority",
-            "k_subtiling", "lds_pipeline", "v9"). "v9" is a 2x2 tile-sliced kernel
-            for large compute-bound shapes (no bias/activation, standard layout only).
+        kernel_type (str): [gluon only] Kernel variant ("auto", "basic",
+            "warp_priority", "k_subtiling", "lds_pipeline", "v9"). Default
+            "auto" uses wrapper dispatch: v9 when M > 512, else basic with
+            NUM_BUFFERS=2. "v9" is a 2x2 tile-sliced kernel for large
+            compute-bound shapes (no bias/activation, standard layout only).
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
 
     Returns:
