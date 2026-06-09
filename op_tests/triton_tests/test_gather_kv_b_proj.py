@@ -821,9 +821,7 @@ def test_gather_kv_b_proj_mxfp4_weight(k_buffer_type, weight_preshuffle):
         device,
     )
 
-    weight_src = torch.randn(
-        (weight_n, kv_c_dim), device=device, dtype=torch.bfloat16
-    )
+    weight_src = torch.randn((weight_n, kv_c_dim), device=device, dtype=torch.bfloat16)
     kv_proj_weight_u8, kv_proj_scale = torch_dynamic_mxfp4_quant(weight_src)
     kv_proj_weight_ref = _dequant_mxfp4_weight(kv_proj_weight_u8, kv_proj_scale)
 

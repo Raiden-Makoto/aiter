@@ -317,7 +317,6 @@ def _triton_gather_kv_b_proj(
                 mask=context_mask[:, None] & mask_v[None, :],
             )
 
-
     else:
         # All three strides are multiplied by runtime indices that can overflow
         # i32 at large scales. Promote the scalar (broadcast) side to i64 so the multiply
@@ -375,13 +374,17 @@ def _triton_gather_kv_b_proj(
                 kv_proj_scale + k_row0 + offs_n_k, mask=mask_k, other=1.0
             ).to(tl.float32)
             v_nope_scale_vec = tl.load(
-                kv_proj_scale + k_row0 + QkNopeHeadDim + offs_n_v, mask=mask_v, other=1.0
+                kv_proj_scale + k_row0 + QkNopeHeadDim + offs_n_v,
+                mask=mask_v,
+                other=1.0,
             ).to(tl.float32)
         else:
             num_scale_cols: tl.constexpr = KV_CDim // ScaleKGranularity
             k_abs_rows = pid_head * (QkNopeHeadDim + VHeadDim) + offs_n_k
             k_scale_n_idx = k_abs_rows // ScaleNGranularity
-            v_abs_rows = pid_head * (QkNopeHeadDim + VHeadDim) + QkNopeHeadDim + offs_n_v
+            v_abs_rows = (
+                pid_head * (QkNopeHeadDim + VHeadDim) + QkNopeHeadDim + offs_n_v
+            )
             v_scale_n_idx = v_abs_rows // ScaleNGranularity
 
         if WEIGHT_PRESHUFFLE:
@@ -594,14 +597,30 @@ def _triton_gather_kv_b_proj(
                     tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_vec[None, :]
                 )
             else:
-                accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0[None, :]
-                accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0[None, :]
-                accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_1[None, :]
-                accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_1[None, :]
-                accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_2[None, :]
-                accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_2[None, :]
-                accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_3[None, :]
-                accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_3[None, :]
+                accum_k += (
+                    tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0[None, :]
+                )
+                accum_v += (
+                    tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0[None, :]
+                )
+                accum_k += (
+                    tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_1[None, :]
+                )
+                accum_v += (
+                    tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_1[None, :]
+                )
+                accum_k += (
+                    tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_2[None, :]
+                )
+                accum_v += (
+                    tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_2[None, :]
+                )
+                accum_k += (
+                    tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_3[None, :]
+                )
+                accum_v += (
+                    tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_3[None, :]
+                )
 
             accum_k *= k_scalar_scale
             accum_v *= k_scalar_scale

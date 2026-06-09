@@ -93,7 +93,9 @@ def gather_kv_b_proj(
     padded_v = _next_pow2(v_head_dim)
 
     grid = (batch_size * tp_k_head_num_k,)
-    kernel_weight = kv_proj_weight.view(torch.uint8) if is_fp4_weight else kv_proj_weight
+    kernel_weight = (
+        kv_proj_weight.view(torch.uint8) if is_fp4_weight else kv_proj_weight
+    )
     kernel_scale = kv_proj_scale.view(torch.uint8) if is_fp4_weight else kv_proj_scale
     scale_cols = scale_k if is_fp4_weight and not no_scale and not per_row_scale else 1
     _triton_gather_kv_b_proj[grid](
