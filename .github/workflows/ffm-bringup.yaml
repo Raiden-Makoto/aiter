@@ -126,8 +126,10 @@ jobs:
               echo "aiter checkout: $(git rev-parse HEAD)"
               export AITER_USE_SYSTEM_TRITON=1
               export AITER_TRITON_ONLY=1
+              python3 -m pip uninstall -y amd-aiter aiter || true
               python3 -m pip install -r requirements.txt
               python3 -m pip install -e . --no-build-isolation
+              python3 -m pip show amd-aiter
               python3 -c "import aiter; print(f\"aiter module: {aiter.__file__}\")"
               python3 -m pytest -v "${FFM_TEST}"
             '
