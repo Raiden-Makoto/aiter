@@ -32,6 +32,7 @@ concurrency:
 env:
   FFM_IMAGE: ${{ inputs.docker_image || 'rocm/ffm-dev:latest' }}
   FFM_TEST: op_tests/triton_tests/gemm/basic/test_gemm_a16w16_ffm_smoke.py
+  TRITON_WHEEL_ARTIFACT_NAME: triton_wheelhouse
 
 jobs:
   check-signal:
@@ -47,11 +48,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
+  prepare_triton_wheel:
+    needs: check-signal
+    uses: ./.github/workflows/prepare-triton-wheel.yaml
+    with:
+      docker-image: rocm/pytorch:latest
+      artifact-name: triton_wheelhouse
+      retention-days: 3
+
   ffm-aiter-ut:
     name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }})
     # TODO: Restore draft PR gating before marking this PR ready for review.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    needs: check-signal
+    needs: [check-signal, prepare_triton_wheel]
     runs-on: ${{ inputs.runner || 'aiter-1gpu-runner' }}
     timeout-minutes: 60
 
@@ -61,6 +70,13 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
+
+      - name: Download Triton wheel artifact
+        uses: actions/download-artifact@v4
+        timeout-minutes: 30
+        with:
+          name: ${{ env.TRITON_WHEEL_ARTIFACT_NAME }}
+          path: triton_wheels
 
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -116,6 +132,7 @@ jobs:
             --security-opt seccomp=unconfined \
             --shm-size=16gb \
             -e FFM_TEST="${FFM_TEST}" \
+            -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
             -v "${GITHUB_WORKSPACE}:/workspace" \
             -w /workspace \
             "${FFM_IMAGE}" \
