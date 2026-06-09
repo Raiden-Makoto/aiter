@@ -2267,20 +2267,16 @@ def compile_mxscale_gemm(
                             ],
                         )
 
-                    if const_expr(k_pad):
-                        _pro_k_off = split_k_base + arith.index(i * tile_k)
-                        _pro_rem_a, _pro_rem_b = _packed_k_rem(_pro_k_off)
-                        _dg1_a_use = _update_dgroup1_tdim0(dgroup1_a, _pro_rem_a)
-                        _dg1_b_use = _update_dgroup1_tdim0(dgroup1_b, _pro_rem_b)
-                        if const_expr(stage1_dual_b):
-                            _dg1_b_up_use = _update_dgroup1_tdim0(
-                                dgroup1_b_up, _pro_rem_b
-                            )
-                    else:
-                        _dg1_a_use = dgroup1_a
-                        _dg1_b_use = dgroup1_b
-                        if const_expr(stage1_dual_b):
-                            _dg1_b_up_use = dgroup1_b_up
+                    # Prologue loads tiles [0, pre_loaded).  Since
+                    # pre_loaded = num_buffers - 1 and num_k_tiles >= num_buffers,
+                    # pre_loaded < num_k_tiles, so prologue never touches the
+                    # last K-tile.  Combined with pad < tile_k (only the last
+                    # tile contains any padded region), the per-tile K-rem
+                    # override is unnecessary here.
+                    _dg1_a_use = dgroup1_a
+                    _dg1_b_use = dgroup1_b
+                    if const_expr(stage1_dual_b):
+                        _dg1_b_up_use = dgroup1_b_up
 
                     issue_tdm_loads(
                         tdm_ops.TDMDescriptor2D(dg0_a, _dg1_a_use),
@@ -2535,7 +2531,14 @@ def compile_mxscale_gemm(
                                             _ab[5][1],
                                         ],
                                     )
-                                if const_expr(k_pad):
+                                # Main loop loads tiles
+                                # [pre_loaded, pre_loaded + loop_iters*num_buffers).
+                                # When extra > 0, the last K-tile lands in the
+                                # tail (never in the main loop), so the per-tile
+                                # K-rem override is unnecessary here.  Only when
+                                # extra == 0 does the main loop's final load
+                                # touch padded data and need the override.
+                                if const_expr(k_pad and extra == 0):
                                     _ml_rem_a, _ml_rem_b = _packed_k_rem(_k_off)
                                     _dg1_a_use = _update_dgroup1_tdim0(
                                         dgroup1_a, _ml_rem_a
