@@ -35,7 +35,7 @@ env:
 
 jobs:
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    # TODO: Restore draft PR gating before marking this PR ready for review.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -49,7 +49,8 @@ jobs:
 
   ffm-aiter-ut:
     name: FFM Aiter UT (${{ inputs.runner || 'aiter-1gpu-runner' }})
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    # TODO: Restore draft PR gating before marking this PR ready for review.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     needs: check-signal
     runs-on: ${{ inputs.runner || 'aiter-1gpu-runner' }}
     timeout-minutes: 60
