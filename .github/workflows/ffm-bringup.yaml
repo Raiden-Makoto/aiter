@@ -130,6 +130,7 @@ jobs:
               python3 -m pip install -r requirements.txt
               python3 -m pip install -e . --no-build-isolation
               python3 -m pip show amd-aiter
+              ./.github/scripts/install_triton.sh
               python3 -m pip show amd-triton triton || true
               python3 -c "import aiter; print(f\"aiter module: {aiter.__file__}\")"
               python3 -m pytest -v "${FFM_TEST}"
