@@ -1406,14 +1406,29 @@ def _gemm_a16w16_v9_kernel(
     # set_bounds below), so K need not be a multiple of BLOCK_K either.
     m_rem = M - pid_m * BLOCK_M
     n_rem = N - pid_n * BLOCK_N
+
+    # The bottom (A) / right (B) halves start HALF_M / HALF_N rows into the tile.
+    # When the last tile's valid extent is smaller than the half (i.e. M % BLOCK_M
+    # or N % BLOCK_N falls in (0, HALF)), that half lies entirely past the matrix
+    # edge: the naive base (pid*BLOCK + HALF) points beyond the tensor and the
+    # remaining extent (m_rem - HALF_M / n_rem - HALF_N) goes negative, which the
+    # TDM engine reads as a huge unsigned bound and dereferences -> OOB read /
+    # illegal access. Clamp the half start to [.., M] / [.., N] and the row count
+    # to >= 0 so a fully-OOB half loads zero (zero-filled) rows and contributes
+    # nothing, instead of faulting. For full tiles these are unchanged.
+    a_bot_start = gl.minimum(pid_m * BLOCK_M + HALF_M, M)
+    a_bot_rows = M - a_bot_start
+    b_right_start = gl.minimum(pid_n * BLOCK_N + HALF_N, N)
+    b_right_rows = N - b_right_start
+
     a_top_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=a_ptr + pid_m * BLOCK_M * stride_am,
         shape=(m_rem, K), strides=(stride_am, stride_ak),
         block_shape=(HALF_M, BLOCK_K), layout=sharedLayoutA
     )
     a_bot_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=a_ptr + (pid_m * BLOCK_M + HALF_M) * stride_am,
-        shape=(m_rem - HALF_M, K), strides=(stride_am, stride_ak),
+        base=a_ptr + a_bot_start * stride_am,
+        shape=(a_bot_rows, K), strides=(stride_am, stride_ak),
         block_shape=(HALF_M, BLOCK_K), layout=sharedLayoutA
     )
     b_left_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -1422,8 +1437,8 @@ def _gemm_a16w16_v9_kernel(
         block_shape=(HALF_N, BLOCK_K), layout=sharedLayoutB
     )
     b_right_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=b_ptr + (pid_n * BLOCK_N + HALF_N) * stride_bn,
-        shape=(n_rem - HALF_N, K), strides=(stride_bn, stride_bk),
+        base=b_ptr + b_right_start * stride_bn,
+        shape=(b_right_rows, K), strides=(stride_bn, stride_bk),
         block_shape=(HALF_N, BLOCK_K), layout=sharedLayoutB
     )
 
@@ -1457,9 +1472,9 @@ def _gemm_a16w16_v9_kernel(
     # bound is refreshed to the remaining extent (K - k_off) on every advance so
     # the TDM engine zero-fills any K tile past the true K.
     a_top_bound0 = m_rem
-    a_bot_bound0 = m_rem - HALF_M
+    a_bot_bound0 = a_bot_rows
     b_left_bound0 = n_rem
-    b_right_bound0 = n_rem - HALF_N
+    b_right_bound0 = b_right_rows
 
     # Prologue: TDM tiles 0,1; LR 2 sub-tiles from buf 0.
     # TDM order: B_left, A_top, A_bot, B_right.
@@ -1721,10 +1736,14 @@ def select_gemm_a16w16_kernel(
         return "v9", None
 
     tuned_config, _ = _get_config(M, N, K)
-    tuned_config["NUM_BUFFERS"] = 2
     if config is not None:
         tuned_config.update(config)
-    return "basic", tuned_config
+    # Memory-bound shapes default to the basic kernel, but a tuned config may
+    # request a latency-hiding variant (e.g. "warp_priority" / "lds_pipeline")
+    # via an optional KERNEL_TYPE key. Pop it so it never leaks into the kernel
+    # launch (which reads explicit BLOCK_*/NUM_BUFFERS keys, not **config).
+    kernel_type = tuned_config.pop("KERNEL_TYPE", "basic")
+    return kernel_type, tuned_config
 
 
 def _gemm_a16w16_v9(
