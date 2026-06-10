@@ -45,4 +45,15 @@ void mhc_post(torch::Tensor& out,            // (m, hc_mult, hidden_size)
               torch::Tensor& post_layer_mix, // (m, hc_mult)
               torch::Tensor& comb_res_mix    // (m, hc_mult, hc_mult)
 );
+// Route B fused post + pre-norm GEMM/sqrsum. Writes the bf16 residual `out`
+// byte-for-byte like mhc_post and returns {gemm_out_mul (k_blocks, m, hc_mult3),
+// gemm_out_sqrsum (k_blocks, m)} for mhc_pre_big_fuse (k_blocks == post split).
+std::vector<torch::Tensor>
+mhc_post_gemm_sqrsum(torch::Tensor& out,            // (m, hc_mult, hidden_size)
+                     torch::Tensor& x,              // (m, hidden_size)
+                     torch::Tensor& residual,       // (m, hc_mult, hidden_size)
+                     torch::Tensor& post_layer_mix, // (m, hc_mult)
+                     torch::Tensor& comb_res_mix,   // (m, hc_mult, hc_mult)
+                     torch::Tensor& fn              // (hc_mult3, hc_mult * hidden_size)
+);
 } // namespace aiter

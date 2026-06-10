@@ -202,3 +202,81 @@ def mhc_post(
     post_layer_mix: Tensor,
     comb_res_mix: Tensor,
 ) -> None: ...
+
+
+def mhc_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Route B fused boundary: ``mhc_post`` + pre-norm GEMM/sqrsum, then the
+    unchanged ``mhc_pre_big_fuse``.
+
+    Replaces the unfused ``mhc_post -> mhc_pre_gemm_sqrsum -> mhc_pre_big_fuse``
+    chain for the next layer's pre block. ``big_fuse`` is byte-for-byte unchanged;
+    it still re-reads the bf16 residual that the fused kernel writes.
+
+    Returns:
+        residual_out: post-mapped residual, shape (m, hc_mult, hidden_size) bf16
+        post_mix:     shape (m, hc_mult, 1) fp32
+        comb_mix:     shape (m, hc_mult, hc_mult) fp32
+        layer_input:  shape (m, hidden_size) bf16
+    """
+    m = residual.size(0)
+    hc_mult = residual.size(1)
+    hidden_size = residual.size(2)
+    device = residual.device
+
+    out = torch.empty_like(residual)
+    gemm_out_mul, gemm_out_sqrsum = mhc_post_gemm_sqrsum(
+        out, x, residual, post_layer_mix, comb_res_mix, fn
+    )
+
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
+    mhc_pre_big_fuse(
+        post_mix,
+        comb_mix,
+        layer_input,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        out,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return out, post_mix, comb_mix, layer_input
+
+
+@compile_ops("module_mhc")
+def mhc_post_gemm_sqrsum(
+    out: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    fn: Tensor,
+) -> list[Tensor]:
+    """Route B fused post + pre-norm GEMM/sqrsum.
+
+    Writes the bf16 residual ``out`` byte-for-byte identically to ``mhc_post`` and
+    returns ``[gemm_out_mul, gemm_out_sqrsum]`` where
+    ``gemm_out_mul`` is ``(k_blocks, m, hc_mult3)`` and ``gemm_out_sqrsum`` is
+    ``(k_blocks, m)`` -- exactly the split layout ``mhc_pre_big_fuse`` consumes.
+    ``k_blocks`` is the post kernel's internal hidden split (== n_splits).
+    """
+    ...
