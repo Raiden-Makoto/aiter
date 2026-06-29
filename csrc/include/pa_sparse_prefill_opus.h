@@ -2650,16 +2650,170 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
 // =============================================================================
 namespace pa_16mx8_32nx1_fp8 {
 
-namespace p1 = pa_16mx1_16nx4_fp8;
+namespace pn1 = pa_16mx1_16nx4_fp8;
 namespace p8 = pa_16mx8_32nx1;
 
-// One 16-token N-sub-tile of native-MXFP8 NoPE QKᵀ + bf16 RoPE QKᵀ, plus the
-// E8M0 dequant of this sub-tile's K into the shared bf16 V tile in LDS.
+// Cooperative once-per-tile staging of the sparse fp8 K tile into LDS, split
+// into a register-prefetch front-end + an LDS-commit back-end so the (expensive)
+// gmem gather of tile N+1 is issued and kept in flight during tile N's QK/PV
+// compute (software-pipelined prefetch). All NUM_WARPS warps cooperate so the
+// KV tile is loaded exactly once (no per-warp redundant re-load), with the
+// fp8→bf16 dequant as the front-end.
+//
+//   prefetch_kv_tile: gather the packed fp8 NoPE rows (NoPE + embedded E8M0
+//             scales + pad = D_NOPE_PADDED_SIZE fp8/row) and the bf16 RoPE rows
+//             from gmem into per-thread registers, preserving the per-row layout
+//             so QK/dequant read it with the exact same mapping as the gmem
+//             gather. No LDS write and no barrier here.
+//   commit_kv_tile: publish the prefetched fp8 (incl. scales) + bf16 RoPE into
+//             LDS, then dequant the fp8 NoPE → bf16 into the shared V tile (E8M0
+//             per 32-element block), so QK reads fp8 K and PV reads bf16 V.
+//
+// OOB tokens (token >= valid_kv_len) are zero-filled; their QK scores are
+// masked to -inf downstream so the zeroed K/V never contribute.
+// Per-thread register buffer holding one prefetched KV tile's packed fp8 NoPE
+// (NoPE + embedded E8M0 scales + pad) and bf16 RoPE u32 words, in the same
+// thread→element mapping the LDS publish uses.
+template<class T>
+struct kv_tile_prefetch {
+    static constexpr int U32_PER_NOPE_ROW = T::D_NOPE_PADDED_SIZE / 4;            // 128
+    static constexpr int N_NOPE_U32       = T::KV_TILE_SIZE * U32_PER_NOPE_ROW;   // 4096
+    static constexpr int NOPE_REG         = (N_NOPE_U32 + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE; // 8
+    static constexpr int U32_PER_ROPE_ROW = T::D_ROPE_SIZE / 2;                   // 32
+    static constexpr int N_ROPE_U32       = T::KV_TILE_SIZE * U32_PER_ROPE_ROW;   // 1024
+    static constexpr int ROPE_REG         = (N_ROPE_U32 + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE; // 2
+    opus::u32_t nope[NOPE_REG];
+    opus::u32_t rope[ROPE_REG];
+};
+
+// Front-end: issue the tile's gmem gather into registers (no LDS, no barrier).
+// Issued ahead of the QK/PV compute so the DRAM latency overlaps the MFMAs.
+template<class T>
+__device__ inline void prefetch_kv_tile(
+        const pa_fp8_kargs& kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+        const int* kv_indices, int page_idx_begin, int valid_kv_len, int tile_idx,
+        kv_tile_prefetch<T>& pf) {
+    using namespace opus;
+    using D_NOPE = typename T::D_NOPE;
+    using D_ROPE = typename T::D_ROPE;
+    using PF = kv_tile_prefetch<T>;
+
+    const int tid     = thread_id_x();
+    const int kv_base = tile_idx * T::KV_TILE_SIZE;
+    const D_NOPE* g_nope = reinterpret_cast<const D_NOPE*>(kv_nope_ptr);
+    const D_ROPE* g_rope = reinterpret_cast<const D_ROPE*>(kv_rope_ptr);
+
+    #pragma unroll
+    for (int k = 0; k < PF::NOPE_REG; ++k) {
+        const int i = tid + k * T::BLOCK_SIZE;
+        u32_t val = 0;
+        if (i < PF::N_NOPE_U32) {
+            const int tok = i / PF::U32_PER_NOPE_ROW;
+            const int col = i % PF::U32_PER_NOPE_ROW;
+            if (kv_base + tok < valid_kv_len) {
+                const int page = kv_indices[page_idx_begin + kv_base + tok];
+                val = reinterpret_cast<const u32_t*>(
+                          g_nope + static_cast<int64_t>(page) * kargs.stride_kv_nope_page)[col];
+            }
+        }
+        pf.nope[k] = val;
+    }
+
+    #pragma unroll
+    for (int k = 0; k < PF::ROPE_REG; ++k) {
+        const int i = tid + k * T::BLOCK_SIZE;
+        u32_t val = 0;
+        if (i < PF::N_ROPE_U32) {
+            const int tok = i / PF::U32_PER_ROPE_ROW;
+            const int col = i % PF::U32_PER_ROPE_ROW;
+            if (kv_base + tok < valid_kv_len) {
+                const int page = kv_indices[page_idx_begin + kv_base + tok];
+                val = reinterpret_cast<const u32_t*>(
+                          g_rope + static_cast<int64_t>(page) * kargs.stride_kv_rope_page)[col];
+            }
+        }
+        pf.rope[k] = val;
+    }
+}
+
+// Back-end: publish the prefetched tile into LDS and dequant fp8 NoPE → bf16.
+// The reads of `pf` here force the waitcnt on the prefetched global loads, so
+// they must have been issued (via prefetch_kv_tile) before the prior compute.
+template<class T>
+__device__ inline void commit_kv_tile(
+        const kv_tile_prefetch<T>& pf, char* smem_fp8, char* smem_v) {
+    using namespace opus;
+    using D_ROPE = typename T::D_ROPE;
+    using PF = kv_tile_prefetch<T>;
+
+    const int tid      = thread_id_x();
+    u32_t*  s_nope_u32 = reinterpret_cast<u32_t*>(smem_fp8);
+    D_ROPE* s_v        = reinterpret_cast<D_ROPE*>(smem_v);
+
+    // Protect the LDS tile from the previous iteration's QK/PV readers.
+    s_waitcnt_lgkmcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+
+    // ──── Publish packed fp8 NoPE rows (NoPE + E8M0 scales + pad) ────
+    #pragma unroll
+    for (int k = 0; k < PF::NOPE_REG; ++k) {
+        const int i = tid + k * T::BLOCK_SIZE;
+        if (i < PF::N_NOPE_U32) {
+            const int tok = i / PF::U32_PER_NOPE_ROW;
+            const int col = i % PF::U32_PER_NOPE_ROW;
+            s_nope_u32[tok * PF::U32_PER_NOPE_ROW + col] = pf.nope[k];
+        }
+    }
+
+    // ──── Publish bf16 RoPE rows into the V tile ────
+    #pragma unroll
+    for (int k = 0; k < PF::ROPE_REG; ++k) {
+        const int i = tid + k * T::BLOCK_SIZE;
+        if (i < PF::N_ROPE_U32) {
+            const int tok = i / PF::U32_PER_ROPE_ROW;
+            const int col = i % PF::U32_PER_ROPE_ROW;
+            reinterpret_cast<u32_t*>(s_v + tok * T::SMEM_KV_ROW + T::D_NOPE_SIZE)[col] = pf.rope[k];
+        }
+    }
+
+    // The fp8 scales must be fully staged before the dequant phase reads them.
+    s_waitcnt_lgkmcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+
+    // ──── Dequant fp8 NoPE → bf16 into the V tile (per-32 E8M0) ────
+    const unsigned char* s_nope_u8 = reinterpret_cast<const unsigned char*>(smem_fp8);
+    constexpr int U32_PER_DEQ_ROW = T::D_NOPE_SIZE / 4;                    // 112
+    constexpr int N_DEQ_U32       = T::KV_TILE_SIZE * U32_PER_DEQ_ROW;     // 3584
+    for (int i = tid; i < N_DEQ_U32; i += T::BLOCK_SIZE) {
+        const int tok = i / U32_PER_DEQ_ROW;
+        const int col = i % U32_PER_DEQ_ROW;
+        const int d0  = col * 4;
+        const int blk = d0 / 32;
+        const u32_t e8m0 = static_cast<u32_t>(
+            s_nope_u8[tok * T::D_NOPE_PADDED_SIZE + T::D_NOPE_SIZE + blk]);
+        const float scale  = std::bit_cast<float>(e8m0 << 23);
+        const u32_t packed = s_nope_u32[tok * PF::U32_PER_NOPE_ROW + col];
+        const vector_t<D_ROPE, 2> lo =
+            __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(packed, scale, false);
+        const vector_t<D_ROPE, 2> hi =
+            __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(packed, scale, true);
+        D_ROPE* dst = s_v + tok * T::SMEM_KV_ROW + d0;
+        *reinterpret_cast<vector_t<D_ROPE, 2>*>(dst)     = lo;
+        *reinterpret_cast<vector_t<D_ROPE, 2>*>(dst + 2) = hi;
+    }
+
+    s_waitcnt_lgkmcnt(0_I);
+    __builtin_amdgcn_s_barrier();
+}
+
+// One 16-token N-sub-tile of native-MXFP8 NoPE QKᵀ + bf16 RoPE QKᵀ, reading the
+// cooperatively-staged fp8 K (NoPE + scales) and bf16 K (RoPE) from LDS. Because
+// the fp8 NoPE tile keeps the same per-row layout as gmem, the gmem K-read /
+// scale-read layouts are reused verbatim with only the per-lane base offset
+// switched from a gmem page gather to a contiguous LDS row offset.
 template<class T, class VQN, class VQR, class VQS, class VS>
 __device__ inline void qk_subtile(
-        const pa_fp8_kargs& kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
-        int kv_rows, const int* kv_indices, int page_idx_begin, int valid_kv_len,
-        int tile_idx, int sub, char* smem_kv,
+        int sub, char* smem_fp8, char* smem_v,
         VQN& v_q_nope, VQR& v_q_rope, VQS& v_q_mxscl, VS& v_s_sub) {
     using namespace opus;
     using D_NOPE = typename T::D_NOPE;
@@ -2668,11 +2822,8 @@ __device__ inline void qk_subtile(
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));  // break CSE
 
-    auto g_k_nope = make_gmem(reinterpret_cast<const D_NOPE*>(kv_nope_ptr), kv_rows * kargs.stride_kv_nope_page * sizeof(D_NOPE));
-    auto g_k_rope = make_gmem(reinterpret_cast<const D_ROPE*>(kv_rope_ptr), kv_rows * kargs.stride_kv_rope_page * sizeof(D_ROPE));
-    auto g_kv_indices = make_gmem(kv_indices + page_idx_begin, valid_kv_len * sizeof(int));
-
-    auto s_kv = make_smem(reinterpret_cast<D_ROPE*>(smem_kv));
+    auto s_nope = make_smem(reinterpret_cast<D_NOPE*>(smem_fp8));
+    auto s_v    = make_smem(reinterpret_cast<D_ROPE*>(smem_v));
 
     // Per-warp-local MFMA ops (T_N=1): every warp computes its own 16x16 scores.
     auto mma0_nope = make_tiled_mma<D_NOPE, D_NOPE, typename T::D_ACC>(
@@ -2686,31 +2837,26 @@ __device__ inline void qk_subtile(
         seq<T::W_M, T::W_N, T::W_K_ROPE>{},
         mfma_adaptor_swap_ab{});
 
-    auto u_rk_nope    = p1::make_layout_rk_nope<T>(lane_id);
-    auto u_rk_rope    = p1::make_layout_rk_rope<T>(lane_id);
-    auto u_sk_nope    = p1::make_layout_sk_nope<T>(0, lane_id);
-    auto u_sk_rope    = p1::make_layout_sk_rope<T>(0, lane_id);
-    auto u_kv_indices = p1::make_layout_kv_indices<T>(0, lane_id);
+    auto u_rk_nope = pn1::make_layout_rk_nope<T>(lane_id);
+    auto u_rk_rope = pn1::make_layout_rk_rope<T>(lane_id);
 
-    const int kv_pos  = tile_idx * T::KV_TILE_SIZE + sub * T::W_N;
-    const int kv_page = load(g_kv_indices, u_kv_indices, kv_pos)[0];
-    s_waitcnt_vmcnt(0_I);
+    // Token this lane's N-index maps to within the staged tile (n = lane % W_N).
+    const int tok_in_tile   = sub * T::W_N + (lane_id % T::W_N);
+    const int smem_k_off    = tok_in_tile * T::D_NOPE_PADDED_SIZE;
+    const int smem_rope_off = tok_in_tile * T::SMEM_KV_ROW + T::D_NOPE_SIZE;
 
-    auto kv_nope_offset = kv_page * kargs.stride_kv_nope_page;
-    auto kv_rope_offset = kv_page * kargs.stride_kv_rope_page;
-
-    auto v_k_nope = load<T::VEC_KV_NOPE>(g_k_nope, u_rk_nope + kv_nope_offset);
-    auto v_k_rope = load<T::VEC_KV_ROPE>(g_k_rope, u_rk_rope + kv_rope_offset);
+    auto v_k_nope = load<T::VEC_KV_NOPE>(s_nope, u_rk_nope + smem_k_off);
+    auto v_k_rope = load<T::VEC_KV_ROPE>(s_v, u_rk_rope + smem_rope_off);
 
     constexpr index_t k_nope_len  = vector_traits<decltype(v_k_nope)>::size();
     constexpr index_t k_nope_vals = k_nope_len * T::D_NOPE_SIZE / T::D_NOPE_PADDED_SIZE;
     static_for([&](auto i) { v_k_nope[i.value] = static_cast<D_NOPE>(0); }, number<k_nope_vals>{}, number<k_nope_len>{});
 
-    auto v_k_mxscl = load<T::VEC_KV_NOPE>(g_k_nope, kv_nope_offset + T::D_NOPE_SIZE);
+    auto v_k_mxscl = load<T::VEC_KV_NOPE>(s_nope, smem_k_off + T::D_NOPE_SIZE);
     constexpr index_t k_mxscl_len  = vector_traits<decltype(v_k_mxscl)>::size();
     constexpr index_t k_mxscl_vals = T::D_NOPE_SIZE / 32;
     static_for([&](auto i) { v_k_mxscl[i.value] = static_cast<D_NOPE>(0); }, number<k_mxscl_vals>{}, number<k_mxscl_len>{});
-    p1::reorder_mxscl_for_opsel<T>(v_k_mxscl);
+    pn1::reorder_mxscl_for_opsel<T>(v_k_mxscl);
 
     // ──── GEMM0: S = Q·Kᵀ (NoPE MXFP8) ────
     const int kblk = lane_id / T::W_M;
@@ -2726,37 +2872,16 @@ __device__ inline void qk_subtile(
         v_s_sub = mma0_nope.step_k(ek, v_q_nope, v_k_nope, v_s_sub, scale_q, scale_k, ek, ek);
     });
 
-    // ──── Dequantize K NoPE: fp8 → bf16 with per-block E8M0 scale ────
-    const int gh = kblk >> 1;
-    const u32_t k_scl_r0 = (gh ? k_scl_w[1] : k_scl_w[0]);
-    const u32_t k_scl_r1 = (gh ? k_scl_w[3] : k_scl_w[2]);
-    vector_t<D_ROPE, k_nope_vals> v_k_nope_bf16;
-    auto& k_nope_w        = reinterpret_cast<const vector_t<u32_t, k_nope_len / 4>&>(v_k_nope);
-    auto* k_nope_bf16_pk  = reinterpret_cast<vector_t<D_ROPE, 2>*>(&v_k_nope_bf16);
-    static_for<k_nope_vals / 4>([&](auto d) {
-        constexpr int ek   = d.value / 8;
-        constexpr int rept = (d.value / 4) % 2;
-        const u32_t e8m0   = (((rept == 0) ? k_scl_r0 : k_scl_r1) >> (8 * ek)) & 0xFFu;
-        const float scale  = std::bit_cast<float>(e8m0 << 23);
-        k_nope_bf16_pk[d.value * 2 + 0] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(k_nope_w[d.value], scale, false);
-        k_nope_bf16_pk[d.value * 2 + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(k_nope_w[d.value], scale, true);
-    });
-
     // ──── GEMM0: S = Q·Kᵀ (RoPE bf16) ────
     v_s_sub = mma0_rope(v_q_rope, v_k_rope, v_s_sub);
-
-    // ──── Stage bf16 KV for this sub-tile into the shared V tile ────
-    const int sub_row_off = sub * T::W_N * T::SMEM_KV_ROW;
-    store<T::VEC_KV_NOPE>(s_kv, v_k_nope_bf16, u_sk_nope + sub_row_off);
-    store<T::VEC_KV_ROPE>(s_kv, v_k_rope, u_sk_rope + sub_row_off + T::D_NOPE_SIZE);
 }
 
 template<class Traits, class VQN, class VQR, class VQS, class VO>
 __device__ void pa_prefill_16mx8_32nx1_fp8_pipeline(
         pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
-        int kv_rows, const int* kv_indices,
+        const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-        char* smem_kv,
+        char* smem_fp8, char* smem_v,
         VQN& v_q_nope, VQR& v_q_rope, VQS& v_q_mxscl, VO& v_o,
         typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
         float temperature_scale) {
@@ -2768,7 +2893,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipeline(
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));  // break CSE
 
-    auto s_kv = make_smem(reinterpret_cast<D_ROPE*>(smem_kv));
+    auto s_v = make_smem(reinterpret_cast<D_ROPE*>(smem_v));
 
     auto mma1 = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
         seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
@@ -2776,7 +2901,7 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipeline(
         seq<T::W_M, T::W_N, T::W_K_ROPE>{},
         mfma_adaptor_swap_ab{});
 
-    auto u_rv = p1::make_layout_rv<T>(0, lane_id);
+    auto u_rv = pn1::make_layout_rv<T>(0, lane_id);
 
     typename decltype(mma1)::vtype_a v_p;
     typename decltype(mma1)::vtype_b v_v;
@@ -2789,12 +2914,27 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipeline(
 
     const D_ACC neg_inf = -opus::numeric_limits<D_ACC>::infinity();
 
+    // Prime the software pipeline: issue tile 0's gmem gather into registers.
+    kv_tile_prefetch<T> pf;
+    if (num_kv_tiles > 0) {
+        prefetch_kv_tile<T>(kargs, kv_nope_ptr, kv_rope_ptr, kv_indices,
+                            page_idx_begin, valid_kv_len, 0, pf);
+    }
+
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
+        // Publish the already-prefetched tile into LDS + dequant (all warps).
+        commit_kv_tile<T>(pf, smem_fp8, smem_v);
+
+        // Issue the next tile's gmem gather now; its DRAM latency overlaps the
+        // QK/PV compute below (the registers are consumed at the next commit).
+        if (tile_idx + 1 < num_kv_tiles) {
+            prefetch_kv_tile<T>(kargs, kv_nope_ptr, kv_rope_ptr, kv_indices,
+                                page_idx_begin, valid_kv_len, tile_idx + 1, pf);
+        }
+
         v_s_sub_t v_s0, v_s1;
-        qk_subtile<T>(kargs, kv_nope_ptr, kv_rope_ptr, kv_rows, kv_indices, page_idx_begin,
-                      valid_kv_len, tile_idx, 0, smem_kv, v_q_nope, v_q_rope, v_q_mxscl, v_s0);
-        qk_subtile<T>(kargs, kv_nope_ptr, kv_rope_ptr, kv_rows, kv_indices, page_idx_begin,
-                      valid_kv_len, tile_idx, 1, smem_kv, v_q_nope, v_q_rope, v_q_mxscl, v_s1);
+        qk_subtile<T>(0, smem_fp8, smem_v, v_q_nope, v_q_rope, v_q_mxscl, v_s0);
+        qk_subtile<T>(1, smem_fp8, smem_v, v_q_nope, v_q_rope, v_q_mxscl, v_s1);
 
         static_for<s_sub_len>([&](auto i) {
             v_s[i.value]             = v_s0[i.value];
@@ -2802,29 +2942,26 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipeline(
         });
 
         // ──── Warp-local online softmax ────
-        p1::scale_output_tile<T>(v_s, temperature_scale);
+        pn1::scale_output_tile<T>(v_s, temperature_scale);
         if ((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len) {
-            p1::attn_mask_oob_kv_tile<T>(v_s, valid_kv_len, tile_idx, neg_inf, /*warp_id (unused for masking pos)*/0, lane_id);
+            pn1::attn_mask_oob_kv_tile<T>(v_s, valid_kv_len, tile_idx, neg_inf, /*warp_id (unused for masking pos)*/0, lane_id);
         }
         D_ACC row_max   = max(m_row, p8::attn_row_max<T>(v_s));
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
         m_row = row_max;
-        p1::attn_sub_row<T>(v_s, row_max);
-        p1::attn_exp2_slice<T, 0, s_len>(v_s);
+        pn1::attn_sub_row<T>(v_s, row_max);
+        pn1::attn_exp2_slice<T, 0, s_len>(v_s);
         l_row *= rescale_m;
         l_row += p8::attn_row_sum<T>(v_s);
-        p1::scale_output_tile<T>(v_o, rescale_m);
+        pn1::scale_output_tile<T>(v_o, rescale_m);
 
         v_p = cast<D_ROPE>(v_s);
 
         // ──── GEMM1: O = P·V (bf16, full 32-token contraction) ────
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_s_barrier();
-        v_v = tr_load<T::VEC_TR_V>(s_kv, u_rv);
+        v_v = tr_load<T::VEC_TR_V>(s_v, u_rv);
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_sched_barrier(0);
         v_o = mma1(v_p, v_v, v_o);
-        __builtin_amdgcn_s_barrier();
     }
 }
 
@@ -2850,7 +2987,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx8_32nx1_
     const int64_t q_nope_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_q_nope_n + h_block_start * kargs.stride_q_nope_h;
     const int64_t q_rope_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_q_rope_n + h_block_start * kargs.stride_q_rope_h;
 
-    __shared__ char smem_kv[T::KV_TILE_SIZE * T::SMEM_KV_ROW * sizeof(D_ROPE)];
+    // Cooperatively-staged KV tile: packed fp8 NoPE (incl. E8M0 scales) read by
+    // the MXFP8 QK, plus the dequantized bf16 V tile read by PV. Both are loaded
+    // once per tile by all warps together (no per-warp redundant re-load).
+    __shared__ char smem_fp8[T::KV_TILE_SIZE * T::D_NOPE_PADDED_SIZE * sizeof(D_NOPE)];
+    __shared__ char smem_v[T::KV_TILE_SIZE * T::SMEM_KV_ROW * sizeof(D_ROPE)];
 
     constexpr float LOG2_E = 1.44269504089f;
     const float temperature_scale = kargs.softmax_scale * LOG2_E;
@@ -2858,21 +2999,21 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx8_32nx1_
     auto g_q_nope = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_nope_ptr) + q_nope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_nope_h * sizeof(D_NOPE));
     auto g_q_rope = make_gmem(reinterpret_cast<const D_ROPE*>(kargs.q_rope_ptr) + q_rope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_rope_h * sizeof(D_ROPE));
 
-    auto u_q_nope = p1::make_layout_q_nope<T>(lane_id);
+    auto u_q_nope = pn1::make_layout_q_nope<T>(lane_id);
     auto v_q_nope = load<T::VEC_Q_NOPE>(g_q_nope, u_q_nope);
     constexpr index_t q_nope_len  = vector_traits<decltype(v_q_nope)>::size();
     constexpr index_t q_nope_vals = T::Q_TILE_SIZE * T::D_NOPE_SIZE / T::WARP_SIZE;
     static_for([&](auto i) { v_q_nope[i.value] = static_cast<D_NOPE>(0); }, number<q_nope_vals>{}, number<q_nope_len>{});
 
-    auto u_q_rope = p1::make_layout_q_rope<T>(lane_id);
+    auto u_q_rope = pn1::make_layout_q_rope<T>(lane_id);
     auto v_q_rope = load<T::VEC_Q_ROPE>(g_q_rope, u_q_rope);
 
-    auto u_q_mxscl = p1::make_layout_q_mxscl<T>(lane_id);
+    auto u_q_mxscl = pn1::make_layout_q_mxscl<T>(lane_id);
     auto v_q_mxscl = load<T::VEC_Q_NOPE>(g_q_nope, u_q_mxscl + T::D_NOPE_SIZE);
     constexpr index_t q_mxscl_len  = vector_traits<decltype(v_q_mxscl)>::size();
     constexpr index_t q_mxscl_vals = T::D_NOPE_SIZE / 32;
     static_for([&](auto i) { v_q_mxscl[i.value] = static_cast<D_NOPE>(0); }, number<q_mxscl_vals>{}, number<q_mxscl_len>{});
-    p1::reorder_mxscl_for_opsel<T>(v_q_mxscl);
+    pn1::reorder_mxscl_for_opsel<T>(v_q_mxscl);
 
     vector_t<D_ACC, T::Q_TILE_SIZE * T::D_HEAD_SIZE / (T::T_N * T::WARP_SIZE)> v_o;
     clear(v_o);
@@ -2886,8 +3027,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx8_32nx1_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
         pa_prefill_16mx8_32nx1_fp8_pipeline<Traits>(
-            kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.total_pages, kargs.kv_indices_prefix,
-            page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv,
+            kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
+            page_idx_begin, valid_kv_len, num_kv_tiles, smem_fp8, smem_v,
             v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
     }
 
@@ -2898,8 +3039,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx8_32nx1_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
         pa_prefill_16mx8_32nx1_fp8_pipeline<Traits>(
-            kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.total_tokens, kargs.kv_indices_extend,
-            page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv,
+            kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
+            page_idx_begin, valid_kv_len, num_kv_tiles, smem_fp8, smem_v,
             v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
     }
 
@@ -2911,12 +3052,12 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx8_32nx1_
     D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_final);
     D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
     D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
-    p1::scale_output_tile<T>(v_o, o_scale);
+    pn1::scale_output_tile<T>(v_o, o_scale);
 
     using D_OUT = typename T::D_OUT;
     const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n + h_block_start * kargs.stride_o_h;
     auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
-    auto u_o = p1::make_layout_o<T>(0, lane_id, kargs.stride_o_h);
+    auto u_o = pn1::make_layout_o<T>(0, lane_id, kargs.stride_o_h);
     auto v_o_out = cast<D_OUT>(v_o);
     store<T::VEC_O>(g_o, v_o_out, u_o);
 }
