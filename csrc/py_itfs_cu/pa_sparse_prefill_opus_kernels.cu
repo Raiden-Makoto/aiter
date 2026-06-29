@@ -8,6 +8,8 @@
 #define PA_SPARSE_PREFILL_OPUS_IMPL
 #include "pa_sparse_prefill_opus.h"
 
+#include <cstdlib>
+
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
@@ -274,11 +276,28 @@ void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
     }
     else
     {
-        using WideTraits = pa_16mx8_32nx1_fp8_traits<16, 32, 640, 8, fp8_t, bf16_t, bf16_t>;
-        const int num_h_blocks = ceil_div(H, WideTraits::Q_TILE_SIZE * WideTraits::T_M);
-        dim3 grid(N, num_h_blocks, 1);
-        dim3 block(WideTraits::BLOCK_SIZE);
-        pa_prefill_16mx8_32nx1_fp8_kernel<WideTraits><<<grid, block, 0, stream>>>(kargs);
-        HIP_CALL_LAUNCH(hipGetLastError());
+        // Wide-head (H > 32). Default to the low-VGPR T_N=2 variant (halves the PV
+        // accumulator + V fragment to escape the 256-VGPR spill); set
+        // AITER_OPUS_WIDE_TN1=1 to fall back to the T_N=1 cooperative baseline.
+        const char* tn1_env = std::getenv("AITER_OPUS_WIDE_TN1");
+        const bool use_tn1 = tn1_env && tn1_env[0] == '1';
+        if(use_tn1)
+        {
+            using WideTraits = pa_16mx8_32nx1_fp8_traits<16, 32, 640, 8, fp8_t, bf16_t, bf16_t>;
+            const int num_h_blocks = ceil_div(H, WideTraits::Q_TILE_SIZE * WideTraits::T_M);
+            dim3 grid(N, num_h_blocks, 1);
+            dim3 block(WideTraits::BLOCK_SIZE);
+            pa_prefill_16mx8_32nx1_fp8_kernel<WideTraits><<<grid, block, 0, stream>>>(kargs);
+            HIP_CALL_LAUNCH(hipGetLastError());
+        }
+        else
+        {
+            using WideTraits = pa_16mx8_32nx2_fp8_traits<16, 32, 640, 8, fp8_t, bf16_t, bf16_t>;
+            const int num_h_blocks = ceil_div(H, WideTraits::Q_TILE_SIZE * WideTraits::T_M);
+            dim3 grid(N, num_h_blocks, 1);
+            dim3 block(WideTraits::BLOCK_SIZE);
+            pa_prefill_16mx8_32nx2_fp8_kernel<WideTraits><<<grid, block, 0, stream>>>(kargs);
+            HIP_CALL_LAUNCH(hipGetLastError());
+        }
     }
 }

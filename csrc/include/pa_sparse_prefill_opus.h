@@ -425,6 +425,86 @@ struct pa_16mx8_32nx1_fp8_traits
     }
 };
 
+// Compile-time tile/MFMA configuration for the split-precision 16mx8_32nx2 fp8
+// variant (T_M=NUM_WARPS/2, T_N=2). Used when H > 32 as a low-VGPR alternative to
+// the 16mx8_32nx1 (T_N=1) wide kernel: the T_N=2 split halves *both* the PV
+// accumulator (v_o) and the V fragment (v_v), each of which is otherwise 128
+// VGPRs and live simultaneously in the single PV MFMA (= the 256-VGPR ceiling and
+// the source of the ~165 spilled VGPRs). Two warps form an M-group: they share
+// the same Q_TILE query heads, split the 32-token KV tile (16 tokens each) for
+// GEMM0, then run a cross-warp online softmax + P broadcast (exactly the
+// 16mx1_16nx4 machinery, replicated per M-group) before a half-D_HEAD PV.
+template <int Q_TILE_SIZE_  = 16,
+          int KV_TILE_SIZE_ = 32,
+          int D_TILE_SIZE_  = 640,
+          int NUM_WARPS_    = 8,
+          typename D_NOPE_  = fp8_t,
+          typename D_ROPE_  = bf16_t,
+          typename D_OUT_   = bf16_t>
+struct pa_16mx8_32nx2_fp8_traits
+{
+    static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
+    static constexpr int D_TILE_SIZE  = D_TILE_SIZE_;
+    static constexpr int NUM_WARPS    = NUM_WARPS_;
+
+    static constexpr int WARP_SIZE  = 64;
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
+
+    static constexpr int D_NOPE_SIZE        = 448;
+    static constexpr int D_NOPE_PADDED_SIZE = 512;
+    static constexpr int D_ROPE_SIZE        = 64;
+    static constexpr int D_HEAD_SIZE        = D_NOPE_SIZE + D_ROPE_SIZE; // 512
+
+    using D_NOPE = D_NOPE_;
+    using D_ROPE = D_ROPE_;
+    using D_ATTN = D_NOPE_;
+    using D_OUT  = D_OUT_;
+    using D_ACC  = float;
+
+    // Two warps share the M (query-head) tile and split N (KV tokens + D_HEAD).
+    static constexpr int T_N = 2;                 // waves along N
+    static constexpr int T_M = NUM_WARPS / T_N;   // waves along M (query heads)
+    static constexpr int T_K = 1;                 // waves along K
+
+    static constexpr int W_M      = 16;
+    static constexpr int W_N      = 16;
+    static constexpr int W_K_NOPE = 128;
+    static constexpr int W_K_ROPE = 32;
+
+    // GEMM0: S = Q @ K^T  (each warp owns one 16-token N-subtile → GEMM0_E_N=1)
+    static constexpr int GEMM0_E_M      = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM0_E_N      = KV_TILE_SIZE / (W_N * T_N);
+    static constexpr int GEMM0_NOPE_E_K = D_NOPE_PADDED_SIZE / W_K_NOPE;
+    static constexpr int GEMM0_ROPE_E_K = D_ROPE_SIZE / W_K_ROPE;
+
+    // GEMM1: O = P @ V  (D_HEAD split across the M-group → GEMM1_E_N=16, v_o halved)
+    static constexpr int GEMM1_E_M = Q_TILE_SIZE / W_M;
+    static constexpr int GEMM1_E_N = D_HEAD_SIZE / (W_N * T_N);
+    static constexpr int GEMM1_E_K = KV_TILE_SIZE / W_K_ROPE;
+
+    static constexpr int VEC_Q_NOPE  = 16;
+    static constexpr int VEC_Q_ROPE  = 8;
+    static constexpr int VEC_KV_NOPE = 16;
+    static constexpr int VEC_KV_ROPE = 8;
+    static constexpr int VEC_P    = 4;
+    static constexpr int VEC_TR_V = 4;
+    static constexpr int VEC_O    = 4;
+
+    static constexpr int SMEM_KV_PAD = 8;
+    static constexpr int SMEM_KV_ROW = D_HEAD_SIZE + SMEM_KV_PAD;
+
+    // LDS: the fp8 staging buffer (reused as the cross-warp P-exchange buffer
+    // after QK), the shared bf16 V tile, and the per-M-group m/l scratch.
+    static constexpr size_t smem_size_bytes()
+    {
+        size_t fp8_or_p = KV_TILE_SIZE * D_NOPE_PADDED_SIZE * sizeof(D_NOPE);
+        size_t v_tile   = KV_TILE_SIZE * SMEM_KV_ROW * sizeof(D_ROPE);
+        size_t ml       = 2 * T_M * T_N * W_M * sizeof(D_ACC);
+        return fp8_or_p + v_tile + ml;
+    }
+};
+
 __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
 // Device kernel templates — declared here, defined in the device pass below.
@@ -436,6 +516,8 @@ template <class Traits>
 __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs);
 template <class Traits>
 __global__ void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs kargs);
+template <class Traits>
+__global__ void pa_prefill_16mx8_32nx2_fp8_kernel(pa_fp8_kargs kargs);
 
 // Pull in the device kernel template bodies only on the gfx950 device pass.
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
@@ -453,6 +535,10 @@ __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs)
 }
 template <class Traits>
 __global__ void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs)
+{
+}
+template <class Traits>
+__global__ void pa_prefill_16mx8_32nx2_fp8_kernel(pa_fp8_kargs)
 {
 }
 #else
@@ -2988,6 +3074,206 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx8_32nx1_
     const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n + h_block_start * kargs.stride_o_h;
     auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
     auto u_o = pn1::make_layout_o<T>(0, lane_id, kargs.stride_o_h);
+    auto v_o_out = cast<D_OUT>(v_o);
+    store<T::VEC_O>(g_o, v_o_out, u_o);
+}
+
+// =============================================================================
+// Variant 16mx8_32nx2 fp8 (T_M=NUM_WARPS/2, T_N=2) — low-VGPR wide-head kernel.
+//
+// Same cooperative once-per-tile fp8->bf16 KV staging as 16mx8_32nx1, but each
+// 32-token KV tile is split across an M-group's two warps (16 tokens each for
+// GEMM0), and the D_HEAD output is split across the same two warps for GEMM1.
+// This halves both the PV accumulator (v_o) and the V fragment (v_v) — the two
+// 128-VGPR vectors that are otherwise live together in the single PV MFMA and
+// pin the kernel at the 256-VGPR ceiling. The cross-warp online softmax + P
+// broadcast reuse the 16mx1_16nx4 helpers verbatim, replicated per M-group via
+// base-pointer offsets into the m/l and P-exchange scratch. The fp8 staging LDS
+// is reused as the P-exchange buffer after QK (they are never live together).
+// =============================================================================
+namespace pa_16mx8_32nx2_fp8 {
+
+namespace pn1     = pa_16mx1_16nx4_fp8;
+namespace p1coop  = pa_16mx8_32nx1_fp8;
+
+template<class Traits, class VQN, class VQR, class VQS, class VO>
+__device__ void pa_prefill_16mx8_32nx2_fp8_pipeline(
+        pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+        const int* kv_indices,
+        int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+        char* smem_fp8, char* smem_v, char* smem_ml,
+        VQN& v_q_nope, VQR& v_q_rope, VQS& v_q_mxscl, VO& v_o,
+        typename Traits::D_ACC& m_row, typename Traits::D_ACC& l_row,
+        float temperature_scale) {
+    using namespace opus;
+    using T = opus::remove_cvref_t<Traits>;
+    using D_ROPE = typename T::D_ROPE;
+    using D_ACC  = typename T::D_ACC;
+
+    int lane_id = thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id));  // break CSE
+    const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+    const int n_idx   = warp_id % T::T_N;   // 0/1: which 16-token half + D_HEAD half
+    const int m_group = warp_id / T::T_N;   // which query-head M-group
+
+    auto s_v = make_smem(reinterpret_cast<D_ROPE*>(smem_v));
+    // Per-M-group cross-warp scratch: m/l in fp32 (smem_ml), P-exchange in bf16
+    // aliased onto the fp8 staging buffer (free after QK in this iteration).
+    auto s_m = make_smem(reinterpret_cast<D_ACC*>(smem_ml) + m_group * T::T_N * T::W_M);
+    auto s_l = make_smem(reinterpret_cast<D_ACC*>(smem_ml) + T::T_M * T::T_N * T::W_M + m_group * T::T_N * T::W_M);
+    auto s_p = make_smem(reinterpret_cast<D_ROPE*>(smem_fp8) + m_group * T::T_N * T::W_M * T::W_N);
+
+    auto mma1 = make_tiled_mma<D_ROPE, D_ROPE, D_ACC>(
+        seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
+        seq<T::T_M, T::T_N, T::T_K>{},
+        seq<T::W_M, T::W_N, T::W_K_ROPE>{},
+        mfma_adaptor_swap_ab{});
+
+    auto u_rv = pn1::make_layout_rv<T>(n_idx, lane_id);
+
+    typename decltype(mma1)::vtype_a v_p;
+    typename decltype(mma1)::vtype_b v_v;
+
+    // Per-warp score length (GEMM0_E_N=1): one 16x16 sub-tile of scores.
+    constexpr index_t s_len = T::GEMM0_E_M * (T::W_M * T::W_N / T::WARP_SIZE);
+    auto v_p_warps = reinterpret_cast<vector_t<D_ROPE, s_len>*>(&v_p);
+
+    const D_ACC neg_inf = -opus::numeric_limits<D_ACC>::infinity();
+
+    for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
+        // Cooperative once-per-tile fp8 K load + dequant into LDS (all warps).
+        p1coop::stage_kv_tile_coop<T>(kargs, kv_nope_ptr, kv_rope_ptr, kv_indices,
+                                      page_idx_begin, valid_kv_len, tile_idx, smem_fp8, smem_v);
+
+        // GEMM0: this warp owns the n_idx-th 16-token sub-tile of the 32-token tile.
+        vector_t<D_ACC, s_len> v_s;
+        p1coop::qk_subtile<T>(n_idx, smem_fp8, smem_v, v_q_nope, v_q_rope, v_q_mxscl, v_s);
+
+        // ──── Cross-warp online softmax (over the M-group's two token halves) ────
+        pn1::scale_output_tile<T>(v_s, temperature_scale);
+        if ((tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len) {
+            pn1::attn_mask_oob_kv_tile<T>(v_s, valid_kv_len, tile_idx, neg_inf, warp_id, lane_id);
+        }
+        D_ACC row_max   = max(m_row, pn1::attn_row_max<T>(v_s, s_m, warp_id, lane_id));
+        D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+        m_row = row_max;
+        pn1::attn_sub_row<T>(v_s, row_max);
+        pn1::attn_exp2_slice<T, 0, s_len>(v_s);
+        l_row *= rescale_m;
+        l_row += pn1::attn_row_sum<T>(v_s, s_l, warp_id, lane_id);
+        pn1::scale_output_tile<T>(v_o, rescale_m);
+
+        // ──── Broadcast P across the M-group's two warps (full 32-token row) ────
+        auto v_p_seg = cast<D_ROPE>(v_s);
+        store<s_len>(s_p, v_p_seg, n_idx * T::W_M * T::W_N + lane_id * s_len);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
+        static_for<T::T_N>([&](auto i) {
+            v_p_warps[i.value] = load<s_len>(s_p, i.value * T::W_M * T::W_N + lane_id * s_len);
+        });
+
+        // ──── GEMM1: O = P·V (bf16) — this warp computes its D_HEAD half ────
+        v_v = tr_load<T::VEC_TR_V>(s_v, u_rv);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_sched_barrier(0);
+        v_o = mma1(v_p, v_v, v_o);
+        __builtin_amdgcn_s_barrier();
+    }
+}
+
+} // namespace pa_16mx8_32nx2_fp8
+
+template<class Traits>
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void pa_prefill_16mx8_32nx2_fp8_kernel(pa_fp8_kargs kargs) {
+    using namespace opus;
+    using namespace pa_16mx8_32nx2_fp8;
+    using T = opus::remove_cvref_t<Traits>;
+    using D_NOPE = typename T::D_NOPE;
+    using D_ROPE = typename T::D_ROPE;
+    using D_ACC  = typename T::D_ACC;
+
+    const int q_token_idx = block_id_x();
+    const int h_block_idx = block_id_y();
+
+    const int lane_id = thread_id_x() % T::WARP_SIZE;
+    const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+    const int n_idx   = warp_id % T::T_N;
+    const int m_group = warp_id / T::T_N;
+
+    // Each M-group owns its own Q_TILE_SIZE query heads within the wide block.
+    const int h_block_start = h_block_idx * T::T_M * T::Q_TILE_SIZE + m_group * T::Q_TILE_SIZE;
+    const int64_t q_nope_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_q_nope_n + h_block_start * kargs.stride_q_nope_h;
+    const int64_t q_rope_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_q_rope_n + h_block_start * kargs.stride_q_rope_h;
+
+    __shared__ char smem_fp8[T::KV_TILE_SIZE * T::D_NOPE_PADDED_SIZE * sizeof(D_NOPE)];
+    __shared__ char smem_v[T::KV_TILE_SIZE * T::SMEM_KV_ROW * sizeof(D_ROPE)];
+    __shared__ char smem_ml[2 * T::T_M * T::T_N * T::W_M * sizeof(D_ACC)];
+
+    constexpr float LOG2_E = 1.44269504089f;
+    const float temperature_scale = kargs.softmax_scale * LOG2_E;
+
+    auto g_q_nope = make_gmem(reinterpret_cast<const D_NOPE*>(kargs.q_nope_ptr) + q_nope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_nope_h * sizeof(D_NOPE));
+    auto g_q_rope = make_gmem(reinterpret_cast<const D_ROPE*>(kargs.q_rope_ptr) + q_rope_gmem_offset, (kargs.H - h_block_start) * kargs.stride_q_rope_h * sizeof(D_ROPE));
+
+    auto u_q_nope = pn1::make_layout_q_nope<T>(lane_id);
+    auto v_q_nope = load<T::VEC_Q_NOPE>(g_q_nope, u_q_nope);
+    constexpr index_t q_nope_len  = vector_traits<decltype(v_q_nope)>::size();
+    constexpr index_t q_nope_vals = T::Q_TILE_SIZE * T::D_NOPE_SIZE / T::WARP_SIZE;
+    static_for([&](auto i) { v_q_nope[i.value] = static_cast<D_NOPE>(0); }, number<q_nope_vals>{}, number<q_nope_len>{});
+
+    auto u_q_rope = pn1::make_layout_q_rope<T>(lane_id);
+    auto v_q_rope = load<T::VEC_Q_ROPE>(g_q_rope, u_q_rope);
+
+    auto u_q_mxscl = pn1::make_layout_q_mxscl<T>(lane_id);
+    auto v_q_mxscl = load<T::VEC_Q_NOPE>(g_q_nope, u_q_mxscl + T::D_NOPE_SIZE);
+    constexpr index_t q_mxscl_len  = vector_traits<decltype(v_q_mxscl)>::size();
+    constexpr index_t q_mxscl_vals = T::D_NOPE_SIZE / 32;
+    static_for([&](auto i) { v_q_mxscl[i.value] = static_cast<D_NOPE>(0); }, number<q_mxscl_vals>{}, number<q_mxscl_len>{});
+    pn1::reorder_mxscl_for_opsel<T>(v_q_mxscl);
+
+    vector_t<D_ACC, T::Q_TILE_SIZE * T::D_HEAD_SIZE / (T::T_N * T::WARP_SIZE)> v_o;
+    clear(v_o);
+    D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
+    D_ACC l_row = 0.0f;
+
+    // ──── Prefix segment ────
+    {
+        const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
+        const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
+        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+        pa_prefill_16mx8_32nx2_fp8_pipeline<Traits>(
+            kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
+            page_idx_begin, valid_kv_len, num_kv_tiles, smem_fp8, smem_v, smem_ml,
+            v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
+    }
+
+    // ──── Extend segment ────
+    {
+        const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
+        const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
+        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
+        pa_prefill_16mx8_32nx2_fp8_pipeline<Traits>(
+            kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
+            page_idx_begin, valid_kv_len, num_kv_tiles, smem_fp8, smem_v, smem_ml,
+            v_q_nope, v_q_rope, v_q_mxscl, v_o, m_row, l_row, temperature_scale);
+    }
+
+    // ──── Sink finalization, normalize O, and store to gmem ────
+    const int sink_head_idx = h_block_start + lane_id % T::W_M;
+    auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
+    D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
+    D_ACC m_final = max(m_row, sink_log2);
+    D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_final);
+    D_ACC l_final = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_final);
+    D_ACC o_scale = (l_final > D_ACC(0.0f)) ? (alpha / l_final) : D_ACC(0.0f);
+    pn1::scale_output_tile<T>(v_o, o_scale);
+
+    using D_OUT = typename T::D_OUT;
+    const int64_t o_gmem_offset = static_cast<int64_t>(q_token_idx) * kargs.stride_o_n + h_block_start * kargs.stride_o_h;
+    auto g_o = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset, (kargs.H - h_block_start) * kargs.stride_o_h * sizeof(D_OUT));
+    auto u_o = pn1::make_layout_o<T>(n_idx, lane_id, kargs.stride_o_h);
     auto v_o_out = cast<D_OUT>(v_o);
     store<T::VEC_O>(g_o, v_o_out, u_o);
 }
