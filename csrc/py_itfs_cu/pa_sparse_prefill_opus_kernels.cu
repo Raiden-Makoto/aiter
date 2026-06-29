@@ -145,8 +145,10 @@ void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
                                     aiter_tensor_t& out,
                                     float softmax_scale)
 {
-    // Single compiled configuration: split NoPE fp8 (448 + 14 E8M0 scales + pad
-    // = 512 fp8 slots/row) and RoPE bf16 (64), D_HEAD = 512.
+    // Split NoPE fp8 (448 + 14 E8M0 scales + pad = 512 fp8 slots/row) and RoPE
+    // bf16 (64), D_HEAD = 512. Two tile configs: narrow 16mx1_16nx4 (T_M=1) for
+    // H <= 32, wide-head 16mx8_32nx1 (T_M=8) for H > 32. Both share the packed
+    // hdim layout, so use the narrow traits for shape/dtype constants.
     using Traits = pa_16mx1_16nx4_fp8_traits<16, 64, 640, 4, fp8_t, bf16_t, bf16_t>;
     constexpr int D_NOPE_PADDED = Traits::D_NOPE_PADDED_SIZE; // 512
     constexpr int D_ROPE        = Traits::D_ROPE_SIZE;        // 64
@@ -262,9 +264,21 @@ void pa_sparse_prefill_fp8_opus_fwd(aiter_tensor_t& q_nope,
     HipDeviceGuard guard(q_nope.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M);
-    dim3 grid(N, num_h_blocks, 1);
-    dim3 block(Traits::BLOCK_SIZE);
-    pa_prefill_16mx1_16nx4_fp8_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
-    HIP_CALL_LAUNCH(hipGetLastError());
+    if(H <= 32)
+    {
+        const int num_h_blocks = ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M);
+        dim3 grid(N, num_h_blocks, 1);
+        dim3 block(Traits::BLOCK_SIZE);
+        pa_prefill_16mx1_16nx4_fp8_kernel<Traits><<<grid, block, 0, stream>>>(kargs);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    }
+    else
+    {
+        using WideTraits = pa_16mx8_32nx1_fp8_traits<16, 32, 640, 8, fp8_t, bf16_t, bf16_t>;
+        const int num_h_blocks = ceil_div(H, WideTraits::Q_TILE_SIZE * WideTraits::T_M);
+        dim3 grid(N, num_h_blocks, 1);
+        dim3 block(WideTraits::BLOCK_SIZE);
+        pa_prefill_16mx8_32nx1_fp8_kernel<WideTraits><<<grid, block, 0, stream>>>(kargs);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    }
 }
