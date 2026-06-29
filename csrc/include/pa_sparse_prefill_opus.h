@@ -2653,100 +2653,35 @@ namespace pa_16mx8_32nx1_fp8 {
 namespace pn1 = pa_16mx1_16nx4_fp8;
 namespace p8 = pa_16mx8_32nx1;
 
-// Cooperative once-per-tile staging of the sparse fp8 K tile into LDS, split
-// into a register-prefetch front-end + an LDS-commit back-end so the (expensive)
-// gmem gather of tile N+1 is issued and kept in flight during tile N's QK/PV
-// compute (software-pipelined prefetch). All NUM_WARPS warps cooperate so the
-// KV tile is loaded exactly once (no per-warp redundant re-load), with the
-// fp8→bf16 dequant as the front-end.
+// Cooperative once-per-tile staging of the sparse fp8 K tile into LDS. This is
+// the fp8 analogue of the bf16 16mx8 kernel's cooperative async KV load: all
+// NUM_WARPS warps cooperate to load the KV tile exactly once (instead of each
+// warp redundantly re-loading it), with the fp8->bf16 dequant as the front-end.
 //
-//   prefetch_kv_tile: gather the packed fp8 NoPE rows (NoPE + embedded E8M0
-//             scales + pad = D_NOPE_PADDED_SIZE fp8/row) and the bf16 RoPE rows
-//             from gmem into per-thread registers, preserving the per-row layout
-//             so QK/dequant read it with the exact same mapping as the gmem
-//             gather. No LDS write and no barrier here.
-//   commit_kv_tile: publish the prefetched fp8 (incl. scales) + bf16 RoPE into
-//             LDS, then dequant the fp8 NoPE → bf16 into the shared V tile (E8M0
-//             per 32-element block), so QK reads fp8 K and PV reads bf16 V.
+//   Phase 1a: gather the packed fp8 NoPE rows (NoPE + embedded E8M0 scales +
+//             pad = D_NOPE_PADDED_SIZE fp8/row) into a contiguous fp8 tile,
+//             preserving the per-row layout so QK can read it with the exact
+//             same register layout it used for the gmem gather.
+//   Phase 1b: gather the bf16 RoPE rows directly into the shared bf16 V tile.
+//   Phase 2 : dequant the fp8 NoPE -> bf16 into the shared V tile (E8M0 per
+//             32-element block), so PV reads bf16 V exactly as before.
 //
 // OOB tokens (token >= valid_kv_len) are zero-filled; their QK scores are
 // masked to -inf downstream so the zeroed K/V never contribute.
-// Per-thread register buffer holding one prefetched KV tile's packed fp8 NoPE
-// (NoPE + embedded E8M0 scales + pad) and bf16 RoPE u32 words, in the same
-// thread→element mapping the LDS publish uses.
 template<class T>
-struct kv_tile_prefetch {
-    static constexpr int U32_PER_NOPE_ROW = T::D_NOPE_PADDED_SIZE / 4;            // 128
-    static constexpr int N_NOPE_U32       = T::KV_TILE_SIZE * U32_PER_NOPE_ROW;   // 4096
-    static constexpr int NOPE_REG         = (N_NOPE_U32 + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE; // 8
-    static constexpr int U32_PER_ROPE_ROW = T::D_ROPE_SIZE / 2;                   // 32
-    static constexpr int N_ROPE_U32       = T::KV_TILE_SIZE * U32_PER_ROPE_ROW;   // 1024
-    static constexpr int ROPE_REG         = (N_ROPE_U32 + T::BLOCK_SIZE - 1) / T::BLOCK_SIZE; // 2
-    opus::u32_t nope[NOPE_REG];
-    opus::u32_t rope[ROPE_REG];
-};
-
-// Front-end: issue the tile's gmem gather into registers (no LDS, no barrier).
-// Issued ahead of the QK/PV compute so the DRAM latency overlaps the MFMAs.
-template<class T>
-__device__ inline void prefetch_kv_tile(
+__device__ inline void stage_kv_tile_coop(
         const pa_fp8_kargs& kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
         const int* kv_indices, int page_idx_begin, int valid_kv_len, int tile_idx,
-        kv_tile_prefetch<T>& pf) {
+        char* smem_fp8, char* smem_v) {
     using namespace opus;
     using D_NOPE = typename T::D_NOPE;
     using D_ROPE = typename T::D_ROPE;
-    using PF = kv_tile_prefetch<T>;
 
     const int tid     = thread_id_x();
     const int kv_base = tile_idx * T::KV_TILE_SIZE;
+
     const D_NOPE* g_nope = reinterpret_cast<const D_NOPE*>(kv_nope_ptr);
     const D_ROPE* g_rope = reinterpret_cast<const D_ROPE*>(kv_rope_ptr);
-
-    #pragma unroll
-    for (int k = 0; k < PF::NOPE_REG; ++k) {
-        const int i = tid + k * T::BLOCK_SIZE;
-        u32_t val = 0;
-        if (i < PF::N_NOPE_U32) {
-            const int tok = i / PF::U32_PER_NOPE_ROW;
-            const int col = i % PF::U32_PER_NOPE_ROW;
-            if (kv_base + tok < valid_kv_len) {
-                const int page = kv_indices[page_idx_begin + kv_base + tok];
-                val = reinterpret_cast<const u32_t*>(
-                          g_nope + static_cast<int64_t>(page) * kargs.stride_kv_nope_page)[col];
-            }
-        }
-        pf.nope[k] = val;
-    }
-
-    #pragma unroll
-    for (int k = 0; k < PF::ROPE_REG; ++k) {
-        const int i = tid + k * T::BLOCK_SIZE;
-        u32_t val = 0;
-        if (i < PF::N_ROPE_U32) {
-            const int tok = i / PF::U32_PER_ROPE_ROW;
-            const int col = i % PF::U32_PER_ROPE_ROW;
-            if (kv_base + tok < valid_kv_len) {
-                const int page = kv_indices[page_idx_begin + kv_base + tok];
-                val = reinterpret_cast<const u32_t*>(
-                          g_rope + static_cast<int64_t>(page) * kargs.stride_kv_rope_page)[col];
-            }
-        }
-        pf.rope[k] = val;
-    }
-}
-
-// Back-end: publish the prefetched tile into LDS and dequant fp8 NoPE → bf16.
-// The reads of `pf` here force the waitcnt on the prefetched global loads, so
-// they must have been issued (via prefetch_kv_tile) before the prior compute.
-template<class T>
-__device__ inline void commit_kv_tile(
-        const kv_tile_prefetch<T>& pf, char* smem_fp8, char* smem_v) {
-    using namespace opus;
-    using D_ROPE = typename T::D_ROPE;
-    using PF = kv_tile_prefetch<T>;
-
-    const int tid      = thread_id_x();
     u32_t*  s_nope_u32 = reinterpret_cast<u32_t*>(smem_fp8);
     D_ROPE* s_v        = reinterpret_cast<D_ROPE*>(smem_v);
 
@@ -2754,33 +2689,41 @@ __device__ inline void commit_kv_tile(
     s_waitcnt_lgkmcnt(0_I);
     __builtin_amdgcn_s_barrier();
 
-    // ──── Publish packed fp8 NoPE rows (NoPE + E8M0 scales + pad) ────
-    #pragma unroll
-    for (int k = 0; k < PF::NOPE_REG; ++k) {
-        const int i = tid + k * T::BLOCK_SIZE;
-        if (i < PF::N_NOPE_U32) {
-            const int tok = i / PF::U32_PER_NOPE_ROW;
-            const int col = i % PF::U32_PER_NOPE_ROW;
-            s_nope_u32[tok * PF::U32_PER_NOPE_ROW + col] = pf.nope[k];
+    // Phase 1a: gather packed fp8 NoPE rows (NoPE + E8M0 scales + pad).
+    constexpr int U32_PER_NOPE_ROW = T::D_NOPE_PADDED_SIZE / 4;            // 128
+    constexpr int N_NOPE_U32       = T::KV_TILE_SIZE * U32_PER_NOPE_ROW;   // 4096
+    for (int i = tid; i < N_NOPE_U32; i += T::BLOCK_SIZE) {
+        const int tok = i / U32_PER_NOPE_ROW;
+        const int col = i % U32_PER_NOPE_ROW;
+        u32_t val = 0;
+        if (kv_base + tok < valid_kv_len) {
+            const int page = kv_indices[page_idx_begin + kv_base + tok];
+            val = reinterpret_cast<const u32_t*>(
+                      g_nope + static_cast<int64_t>(page) * kargs.stride_kv_nope_page)[col];
         }
+        s_nope_u32[tok * U32_PER_NOPE_ROW + col] = val;
     }
 
-    // ──── Publish bf16 RoPE rows into the V tile ────
-    #pragma unroll
-    for (int k = 0; k < PF::ROPE_REG; ++k) {
-        const int i = tid + k * T::BLOCK_SIZE;
-        if (i < PF::N_ROPE_U32) {
-            const int tok = i / PF::U32_PER_ROPE_ROW;
-            const int col = i % PF::U32_PER_ROPE_ROW;
-            reinterpret_cast<u32_t*>(s_v + tok * T::SMEM_KV_ROW + T::D_NOPE_SIZE)[col] = pf.rope[k];
+    // Phase 1b: gather bf16 RoPE rows directly into the V tile.
+    constexpr int U32_PER_ROPE_ROW = T::D_ROPE_SIZE / 2;                   // 32
+    constexpr int N_ROPE_U32       = T::KV_TILE_SIZE * U32_PER_ROPE_ROW;   // 1024
+    for (int i = tid; i < N_ROPE_U32; i += T::BLOCK_SIZE) {
+        const int tok = i / U32_PER_ROPE_ROW;
+        const int col = i % U32_PER_ROPE_ROW;
+        u32_t val = 0;
+        if (kv_base + tok < valid_kv_len) {
+            const int page = kv_indices[page_idx_begin + kv_base + tok];
+            val = reinterpret_cast<const u32_t*>(
+                      g_rope + static_cast<int64_t>(page) * kargs.stride_kv_rope_page)[col];
         }
+        reinterpret_cast<u32_t*>(s_v + tok * T::SMEM_KV_ROW + T::D_NOPE_SIZE)[col] = val;
     }
 
     // The fp8 scales must be fully staged before the dequant phase reads them.
     s_waitcnt_lgkmcnt(0_I);
     __builtin_amdgcn_s_barrier();
 
-    // ──── Dequant fp8 NoPE → bf16 into the V tile (per-32 E8M0) ────
+    // Phase 2: dequant fp8 NoPE -> bf16 into the V tile (per-32 E8M0).
     const unsigned char* s_nope_u8 = reinterpret_cast<const unsigned char*>(smem_fp8);
     constexpr int U32_PER_DEQ_ROW = T::D_NOPE_SIZE / 4;                    // 112
     constexpr int N_DEQ_U32       = T::KV_TILE_SIZE * U32_PER_DEQ_ROW;     // 3584
@@ -2792,7 +2735,7 @@ __device__ inline void commit_kv_tile(
         const u32_t e8m0 = static_cast<u32_t>(
             s_nope_u8[tok * T::D_NOPE_PADDED_SIZE + T::D_NOPE_SIZE + blk]);
         const float scale  = std::bit_cast<float>(e8m0 << 23);
-        const u32_t packed = s_nope_u32[tok * PF::U32_PER_NOPE_ROW + col];
+        const u32_t packed = s_nope_u32[tok * U32_PER_NOPE_ROW + col];
         const vector_t<D_ROPE, 2> lo =
             __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(packed, scale, false);
         const vector_t<D_ROPE, 2> hi =
@@ -2914,23 +2857,10 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipeline(
 
     const D_ACC neg_inf = -opus::numeric_limits<D_ACC>::infinity();
 
-    // Prime the software pipeline: issue tile 0's gmem gather into registers.
-    kv_tile_prefetch<T> pf;
-    if (num_kv_tiles > 0) {
-        prefetch_kv_tile<T>(kargs, kv_nope_ptr, kv_rope_ptr, kv_indices,
-                            page_idx_begin, valid_kv_len, 0, pf);
-    }
-
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
-        // Publish the already-prefetched tile into LDS + dequant (all warps).
-        commit_kv_tile<T>(pf, smem_fp8, smem_v);
-
-        // Issue the next tile's gmem gather now; its DRAM latency overlaps the
-        // QK/PV compute below (the registers are consumed at the next commit).
-        if (tile_idx + 1 < num_kv_tiles) {
-            prefetch_kv_tile<T>(kargs, kv_nope_ptr, kv_rope_ptr, kv_indices,
-                                page_idx_begin, valid_kv_len, tile_idx + 1, pf);
-        }
+        // Cooperative once-per-tile fp8 K load + dequant into LDS (all warps).
+        stage_kv_tile_coop<T>(kargs, kv_nope_ptr, kv_rope_ptr, kv_indices,
+                              page_idx_begin, valid_kv_len, tile_idx, smem_fp8, smem_v);
 
         v_s_sub_t v_s0, v_s1;
         qk_subtile<T>(0, smem_fp8, smem_v, v_q_nope, v_q_rope, v_q_mxscl, v_s0);
