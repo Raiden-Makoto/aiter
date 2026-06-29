@@ -421,6 +421,7 @@ def _make_inputs_fp8(
     mode: str = "sparse",
     device: torch.device | str = "cuda",
     seed: int = 0,
+    kv_tile_size: int = _FP8_KV_TILE_SIZE,
 ) -> dict:
     """Build split NoPE-fp8 / RoPE-bf16 inputs plus the matching fp32
     reference rows. Returns ``{"kernel": ..., "ref": ...}`` where ``kernel``
@@ -454,7 +455,7 @@ def _make_inputs_fp8(
                 n,
                 total_rows,
                 device=device,
-                kv_tile_size=_FP8_KV_TILE_SIZE,
+                kv_tile_size=kv_tile_size,
                 seed=seed * 2 + seed_offset,
             )
         if mode == "dense":
@@ -539,6 +540,7 @@ def run_pa_sparse_prefill_opus(
     seed: int = 0,
     verify: bool = True,
     bench: bool = True,
+    fp8_kv_tile_size: int = _FP8_KV_TILE_SIZE,
 ) -> Optional[dict]:
     assert prec in _PRECS, f"unknown prec {prec!r}"
     if _skip_if_unsupported(d=d):
@@ -551,7 +553,15 @@ def run_pa_sparse_prefill_opus(
     )
 
     if prec == "fp8":
-        data = _make_inputs_fp8(n, h, total_pages, total_tokens, mode=mode, seed=seed)
+        data = _make_inputs_fp8(
+            n,
+            h,
+            total_pages,
+            total_tokens,
+            mode=mode,
+            seed=seed,
+            kv_tile_size=fp8_kv_tile_size,
+        )
         kernel_inputs = data["kernel"]
         kernel_fn = pa_sparse_prefill_fp8_opus
         ref_fn, ref_inputs = _ref_pa_sparse_prefill_fp8, data["ref"]
@@ -630,6 +640,41 @@ def test_pa_sparse_prefill_opus(prec, n, h, total_pages, total_tokens, mode):
         seed=(hash((n, h, total_pages, total_tokens, prec, mode)) & 0xFFFF),
         verify=True,
         bench=False,
+    )
+
+
+# Wide-head fp8 path (16mx8_32nx1, H > 32) uses KV_TILE_SIZE = 32, so seed the
+# sparse CSR boundaries at 32 to exercise its full/half/over-tile branches.
+_FP8_WIDE_KV_TILE_SIZE = 32
+_PYTEST_WIDE_SHAPES = [
+    # (N, H, total_pages, total_tokens) -- H > 32 -> wide-head fp8 kernel.
+    (64, 64, 256, 256),
+    (96, 128, 512, 512),
+    (128, 128, 1024, 1024),
+]
+
+
+@pytest.mark.parametrize(
+    "n,h,total_pages,total_tokens",
+    _PYTEST_WIDE_SHAPES,
+    ids=lambda v: "x".join(map(str, v)) if isinstance(v, tuple) else str(v),
+)
+@pytest.mark.parametrize("mode", ["sparse", "dense", "empty"])
+def test_pa_sparse_prefill_fp8_widehead(n, h, total_pages, total_tokens, mode):
+    """fp8 wide-head (H > 32) kernel with CSR boundaries seeded at its
+    KV_TILE_SIZE (32) so the trailing-tile masking branches are covered."""
+    run_pa_sparse_prefill_opus(
+        n=n,
+        h=h,
+        d=512,
+        total_pages=total_pages,
+        total_tokens=total_tokens,
+        prec="fp8",
+        mode=mode,
+        seed=(hash((n, h, total_pages, total_tokens, "fp8wide", mode)) & 0xFFFF),
+        verify=True,
+        bench=False,
+        fp8_kv_tile_size=_FP8_WIDE_KV_TILE_SIZE,
     )
 
 
