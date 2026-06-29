@@ -391,7 +391,8 @@ namespace py = pybind11;
           py::arg("scale_fmt"),                                                     \
           py::arg("weights_scale"),                                                 \
           py::arg("preshuffle") = false,                                            \
-          py::arg("is_neox") = true);                                               \
+          py::arg("is_neox") = true,                                                \
+          py::arg("apply_hadamard") = false);                                       \
     m.def("cp_gather_indexer_k_quant_cache",                                        \
           &aiter::cp_gather_indexer_k_quant_cache,                                  \
           py::arg("kv_cache"),                                                      \

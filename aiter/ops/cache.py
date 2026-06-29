@@ -139,6 +139,7 @@ def indexer_qk_rope_quant_and_cache(
     weights_scale: float,
     preshuffle: bool = False,
     is_neox: bool = True,
+    apply_hadamard: bool = False,
 ) -> None: ...
 
 

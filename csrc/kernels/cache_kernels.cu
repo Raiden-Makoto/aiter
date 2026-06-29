@@ -1399,7 +1399,8 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const float weights_scale,
     const bool use_ue8m0,
     const bool preshuffle,
-    const bool is_neox)
+    const bool is_neox,
+    const bool apply_hadamard)
 {
     static_assert(HEAD_DIM == 128, "Indexer fused qk cache currently supports head_dim=128");
     static_assert(ROPE_DIM == 64, "Indexer fused qk cache currently supports rope_dim=64");
@@ -1448,6 +1449,25 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
                                    : (q_val * cos_v + pair_val * sin_v);
         }
         // Match the separate RoPE path, which materializes q_pe before FP8 quant.
+        q_val = static_cast<float>(static_cast<scalar_t>(q_val));
+    }
+
+    // Optional fused hadamard (rotate_activation): 128-pt natural-order (Sylvester)
+    // FWHT over the post-rope head, scale 1/sqrt(HEAD_DIM), rounded to bf16 to match
+    // the separate rotate_activation -> quant path byte-for-byte.
+    if(apply_hadamard)
+    {
+        q_vals[dim] = q_val;
+        __syncthreads();
+        for(int s = 1; s < HEAD_DIM; s <<= 1)
+        {
+            const float a = q_vals[dim];
+            const float c = q_vals[dim ^ s];
+            __syncthreads();
+            q_vals[dim] = (dim & s) ? (c - a) : (a + c);
+            __syncthreads();
+        }
+        q_val = q_vals[dim] * rsqrtf(static_cast<float>(HEAD_DIM));
         q_val = static_cast<float>(static_cast<scalar_t>(q_val));
     }
 
@@ -1518,6 +1538,22 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
         normed[dim] = k_val;
     }
     __syncthreads();
+
+    // Optional fused hadamard (rotate_activation) on the post-rope key, matching q.
+    if(apply_hadamard)
+    {
+        for(int s = 1; s < HEAD_DIM; s <<= 1)
+        {
+            const float a = normed[dim];
+            const float c = normed[dim ^ s];
+            __syncthreads();
+            normed[dim] = (dim & s) ? (c - a) : (a + c);
+            __syncthreads();
+        }
+        const float h = normed[dim] * rsqrtf(static_cast<float>(HEAD_DIM));
+        normed[dim] = static_cast<float>(static_cast<scalar_t>(h));
+        __syncthreads();
+    }
 
     float k_amax = fabsf(normed[dim]);
     k_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(k_amax, max_func);
@@ -3476,7 +3512,8 @@ void reshape_and_cache_flash(
                                      weights_scale,                                               \
                                      use_ue8m0,                                                   \
                                      do_preshuffle,                                               \
-                                     is_neox);
+                                     is_neox,                                                     \
+                                     apply_hadamard);
 
 #define CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(BLOCK_Y_SIZE)          \
     aiter::cp_gather_indexer_k_quant_cache_kernel<8, BLOCK_Y_SIZE>  \
@@ -3974,7 +4011,8 @@ void indexer_qk_rope_quant_and_cache(
     const std::string& scale_fmt,
     double weights_scale,
     bool preshuffle,
-    bool is_neox)
+    bool is_neox,
+    bool apply_hadamard)
 {
     int num_tokens       = std::min(k.size(0), slot_mapping.size(0));
     int head_dim         = k.size(1);

@@ -106,7 +106,8 @@ void indexer_qk_rope_quant_and_cache(
     const std::string& scale_fmt,
     double weights_scale,
     bool preshuffle = false,
-    bool is_neox = true);
+    bool is_neox = true,
+    bool apply_hadamard = false);
 
 void cp_gather_indexer_k_quant_cache(
     const aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
