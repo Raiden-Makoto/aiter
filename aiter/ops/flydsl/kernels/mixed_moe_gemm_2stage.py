@@ -3116,6 +3116,9 @@ def compile_mixed_moe_gemm2(
     )
     # n-tiles across the output (model_dim) dimension; done-counter is [token, n_tiles].
     _n_tiles_fused = (int(model_dim) + int(tile_n) - 1) // int(tile_n)
+    # Bisect knob: SGLANG_MOE2_NOSPIN=1 skips the consumer spin-wait (reads possibly
+    # incomplete slots -> wrong output, timing/compile diagnosis only).
+    _fused_spin = os.environ.get("SGLANG_MOE2_NOSPIN", "0") != "1"
     lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
     lds_tid_bytes = int(tile_m) * 4
     lds_tw_bytes = (int(tile_m) * 4) if bool(doweight_stage2) else 0
@@ -3275,6 +3278,17 @@ def compile_mixed_moe_gemm2(
             lds_tid = SmemPtr(
                 base_ptr, lds_x_ptr.byte_offset + lds_tid_off, T.i32, shape=(tile_m,)
             ).get()
+            # Fused combine: per-row completion list, reuses the lds_out region
+            # (free after the cshuffle epilogue). Holds the completed token id
+            # (or -1) for each of the tile_m rows so the WG can cooperatively
+            # combine completed tokens.
+            lds_completed = (
+                SmemPtr(
+                    base_ptr, lds_x_ptr.byte_offset, T.i32, shape=(tile_m,)
+                ).get()
+                if fused_combine
+                else None
+            )
             # lds_tw aliases the LDS slot immediately after
             lds_tw_off = lds_tid_off + int(tile_m) * 4
             lds_tw = (
@@ -4803,21 +4817,39 @@ def compile_mixed_moe_gemm2(
                 rocdl.s_setprio(0)
 
                 if const_expr(fused_combine):
-                    # Producer signal: each valid row is one (token t, slot s) written
-                    # at n-tile `by`. Drain outstanding writes, then atomically bump
-                    # done[t*n_tiles + by] (release, agent) so consumers can start the
-                    # topk-sum for (t, by) once the counter hits topk.
-                    rocdl.s_waitcnt(0)
+                    # Fused producer + WG-cooperative combine (no spin, no deadlock).
+                    # Phase 1: each row (token,slot) atomically bumps done[t*n_tiles+by];
+                    # the WG that writes the last slot (old==topk-1) records the token id
+                    # in lds_completed. Phase 2: the whole WG cooperatively topk-sums each
+                    # completed token's tile_n cols (1 col/thread) into arg_fused_out.
+                    # acq_rel/agent atomic: release orders this WG's slot store, acquire
+                    # invalidates L1 so the last-writer's reads see all experts' slots.
                     _one_i32 = arith.constant(1, type=T.i32)
+                    _neg1_i32 = arith.constant(-1, type=T.i32)
                     _c_nt = arith.constant(_n_tiles_fused, index=True)
                     _c4 = arith.constant(4, index=True)
-                    _done_base_i64 = arith.index_cast(T.i64, fx.ptrtoint(arg_done))
-                    _done_base_idx = arith.index_cast(T.index, _done_base_i64)
+                    _c_tn_p = arith.constant(tile_n, index=True)
+                    _c_md_p = arith.constant(model_dim, index=True)
+                    _c_oeb_p = arith.constant(out_elem_bytes, index=True)
+                    _topk_m1 = arith.constant(topk - 1, type=T.i32)
+                    _x_slab_p = arith.index_cast(
+                        T.i64,
+                        arith.constant(topk * model_dim * out_elem_bytes, index=True),
+                    )
+                    _y_slab_p = arith.index_cast(T.i64, _c_md_p * _c_oeb_p)
+                    _out_base_p = arith.index_cast(T.i64, fx.ptrtoint(arg_out))
+                    _fout_base_p = arith.index_cast(T.i64, fx.ptrtoint(arg_fused_out))
+                    _done_base_idx = arith.index_cast(
+                        T.index, arith.index_cast(T.i64, fx.ptrtoint(arg_done))
+                    )
+                    # epilogue finished reading lds_out -> safe to reuse for lds_completed
+                    gpu.barrier()
                     _tid_lt_m = arith.cmpi(
                         CmpIPredicate.ult, tx, arith.constant(tile_m, index=True)
                     )
                     _if_p = scf.IfOp(_tid_lt_m)
                     with ir.InsertionPoint(_if_p.then_block):
+                        memref.store(_neg1_i32, lds_completed, [tx])
                         _row = bx_m + tx
                         _fused = memref.load(lds_tid, [tx])
                         _row_i32 = arith.index_cast(T.i32, _row)
@@ -4842,14 +4874,67 @@ def compile_mixed_moe_gemm2(
                                 if hasattr(_one_i32, "_value")
                                 else _one_i32
                             )
-                            llvm.AtomicRMWOp(
+                            _old = llvm.AtomicRMWOp(
                                 llvm.AtomicBinOp.add,
                                 _pv,
                                 _ov,
-                                llvm.AtomicOrdering.release,
+                                llvm.AtomicOrdering.acq_rel,
                                 syncscope="agent",
-                            )
+                            ).result
+                            _is_last = arith.cmpi(CmpIPredicate.eq, _old, _topk_m1)
+                            _if_last = scf.IfOp(_is_last)
+                            with ir.InsertionPoint(_if_last.then_block):
+                                memref.store(_t, lds_completed, [tx])
+                                scf.YieldOp([])
                             scf.YieldOp([])
+                        scf.YieldOp([])
+                    gpu.barrier()
+                    # Phase 2: cooperative combine. Thread tx<tile_n owns col by*tile_n+tx.
+                    _tid_lt_n = arith.cmpi(CmpIPredicate.ult, tx, _c_tn_p)
+                    _if_c2 = scf.IfOp(_tid_lt_n)
+                    with ir.InsertionPoint(_if_c2.then_block):
+                        _col2 = by * _c_tn_p + tx
+                        for _mm in range_constexpr(tile_m):
+                            _cval = memref.load(lds_completed, [arith.constant(_mm, index=True)])
+                            _is_comp = arith.cmpi(
+                                CmpIPredicate.sge, _cval, arith.constant(0, type=T.i32)
+                            )
+                            _ifm = scf.IfOp(_is_comp)
+                            with ir.InsertionPoint(_ifm.then_block):
+                                _cidx = arith.index_cast(T.index, _cval)
+                                _ci64 = arith.index_cast(T.i64, _cidx)
+                                _xa2 = llvm.AddOp(
+                                    _out_base_p,
+                                    _ci64 * _x_slab_p,
+                                    llvm.IntegerOverflowFlags(0),
+                                ).result
+                                _xr2 = buffer_ops.create_buffer_resource_from_addr(
+                                    _xa2, num_records_bytes=_x_slab_p
+                                )
+                                _acc2 = arith.constant(0.0, type=T.f32)
+                                for _kk in range_constexpr(topk):
+                                    _xoff2 = arith.index_cast(
+                                        T.i32,
+                                        arith.constant(_kk, index=True) * _c_md_p
+                                        + _col2,
+                                    )
+                                    _xv2 = buffer_ops.buffer_load(
+                                        _xr2, _xoff2, vec_width=1, dtype=out_elem()
+                                    )
+                                    _acc2 = _acc2 + _xv2.extf(T.f32)
+                                _ya2 = llvm.AddOp(
+                                    _fout_base_p,
+                                    _ci64 * _y_slab_p,
+                                    llvm.IntegerOverflowFlags(0),
+                                ).result
+                                _yr2 = buffer_ops.create_buffer_resource_from_addr(
+                                    _ya2, num_records_bytes=_y_slab_p
+                                )
+                                _yv2 = arith.trunc_f(out_elem(), _acc2)
+                                buffer_ops.buffer_store(
+                                    _yv2, _yr2, arith.index_cast(T.i32, _col2)
+                                )
+                                scf.YieldOp([])
                         scf.YieldOp([])
 
             all_valid = arith.andi(blk_valid, arith.andi(exp_valid, tile_has_tokens))
@@ -4873,6 +4958,113 @@ def compile_mixed_moe_gemm2(
                 gpu.barrier()
                 scf.YieldOp([expert_i32, expert_b_base])
             for_ip.__exit__(None, None, None)
+
+            if const_expr(False):  # consumer drain superseded by inline combine
+                # ── Consumer drain (DISABLED) ───────────────────────────────
+                # This WG owns n-tile `by` (block_id.x). After finishing its gemm2
+                # m-tiles it combines n-tile `by` for a grid-stride slice of tokens
+                # (strided by bx_persist over cu_num). For each token it spins until
+                # done[t*n_tiles+by]==topk (all experts' slots landed), then
+                # topk-sums arg_out[t,:,cols] -> arg_fused_out[t,cols]. Deadlock-free:
+                # any unfinished slot's owner WG is still in its gemm2 loop.
+                rocdl.sched_barrier(0)
+                c_cu_c = arith.constant(cu_num, index=True)
+                c_nt_c = arith.constant(_n_tiles_fused, index=True)
+                c_tn_c = arith.constant(tile_n, index=True)
+                c_md_c = arith.constant(model_dim, index=True)
+                c_oeb = arith.constant(out_elem_bytes, index=True)
+                topk_i32_c = arith.constant(topk, type=T.i32)
+                x_slab_bytes = arith.index_cast(
+                    T.i64,
+                    arith.constant(topk * model_dim * out_elem_bytes, index=True),
+                )
+                y_slab_bytes = arith.index_cast(
+                    T.i64, c_md_c * c_oeb
+                )
+                out_base_c = arith.index_cast(T.i64, fx.ptrtoint(arg_out))
+                fout_base_c = arith.index_cast(T.i64, fx.ptrtoint(arg_fused_out))
+
+                t_for = scf.ForOp(bx_persist, tokens_in, c_cu_c)
+                with ir.InsertionPoint(t_for.body):
+                    t_c = t_for.induction_variable
+                    done_elem_c = t_c * c_nt_c + by
+                    is_t0_c = arith.cmpi(
+                        CmpIPredicate.eq, tx, arith.constant(0, index=True)
+                    )
+                    if const_expr(_fused_spin):
+                      if0_c = scf.IfOp(is_t0_c)
+                      with ir.InsertionPoint(if0_c.then_block):
+                        init_cur_c = arith.constant(0, type=T.i32)
+                        w_c = scf.WhileOp([T.i32], [init_cur_c])
+                        wb_c = ir.Block.create_at_start(w_c.before, [T.i32])
+                        wa_c = ir.Block.create_at_start(w_c.after, [T.i32])
+                        with ir.InsertionPoint(wb_c):
+                            cur_c = wb_c.arguments[0]
+                            need_c = arith.CmpIOp(
+                                CmpIPredicate.ult, cur_c, topk_i32_c
+                            ).result
+                            scf.ConditionOp(need_c, [cur_c])
+                        with ir.InsertionPoint(wa_c):
+                            d_base = arith.index_cast(T.i64, fx.ptrtoint(arg_done))
+                            d_off = arith.index_cast(
+                                T.i64, done_elem_c * arith.constant(4, index=True)
+                            )
+                            d_addr = llvm.AddOp(
+                                d_base, d_off, llvm.IntegerOverflowFlags(0)
+                            ).result
+                            d_ptr = llvm.IntToPtrOp(
+                                ir.Type.parse("!llvm.ptr<1>"), d_addr
+                            ).result
+                            d_val = llvm.InlineAsmOp(
+                                T.i32,
+                                [d_ptr],
+                                "global_load_dword $0, $1, off sc1",
+                                "=v,v",
+                                has_side_effects=True,
+                            ).result
+                            rocdl.s_waitcnt(0)
+                            scf.YieldOp([d_val])
+                        scf.YieldOp([])
+                    rocdl.sched_barrier(0)
+                    gpu.barrier()
+
+                    is_col_c = arith.cmpi(CmpIPredicate.ult, tx, c_tn_c)
+                    ifc_c = scf.IfOp(is_col_c)
+                    with ir.InsertionPoint(ifc_c.then_block):
+                        col_c = by * c_tn_c + tx
+                        x_addr = llvm.AddOp(
+                            out_base_c,
+                            arith.index_cast(T.i64, t_c) * x_slab_bytes,
+                            llvm.IntegerOverflowFlags(0),
+                        ).result
+                        xr_t = buffer_ops.create_buffer_resource_from_addr(
+                            x_addr, num_records_bytes=x_slab_bytes
+                        )
+                        acc_c = arith.constant(0.0, type=T.f32)
+                        for _kc in range_constexpr(topk):
+                            xoff = arith.index_cast(
+                                T.i32,
+                                arith.constant(_kc, index=True) * c_md_c + col_c,
+                            )
+                            xv = buffer_ops.buffer_load(
+                                xr_t, xoff, vec_width=1, dtype=out_elem()
+                            )
+                            acc_c = acc_c + xv.extf(T.f32)
+                        y_addr = llvm.AddOp(
+                            fout_base_c,
+                            arith.index_cast(T.i64, t_c) * y_slab_bytes,
+                            llvm.IntegerOverflowFlags(0),
+                        ).result
+                        yr_t = buffer_ops.create_buffer_resource_from_addr(
+                            y_addr, num_records_bytes=y_slab_bytes
+                        )
+                        yv = arith.trunc_f(out_elem(), acc_c)
+                        buffer_ops.buffer_store(
+                            yv, yr_t, arith.index_cast(T.i32, col_c)
+                        )
+                        scf.YieldOp([])
+                    scf.YieldOp([])
+                t_for_ip = None
 
     cache_tag = (
         module_name,

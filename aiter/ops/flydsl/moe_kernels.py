@@ -1636,9 +1636,8 @@ def flydsl_moe_stage2(
         fused_done = torch.zeros(
             token_num * _n_tiles, device=out.device, dtype=torch.int32
         )
-        fused_out_buf = torch.empty(
-            token_num * model_dim, device=out.device, dtype=out.dtype
-        )
+        # Kernel's consumer writes the final combined result straight into `out`.
+        fused_out_buf = out.view(-1)
     else:
         fused_done = None
         fused_out_buf = None
@@ -1712,7 +1711,10 @@ def flydsl_moe_stage2(
             raise ValueError(
                 "topk_ids is required when expert_mask is provided for reduce mode"
             )
-    if not accumulate and not return_per_slot:
+    if _fused_active:
+        # Fused megakernel already did the topk-combine straight into `out`.
+        pass
+    elif not accumulate and not return_per_slot:
         _run_moe_reduction(
             target, out, token_num, topk, model_dim, expert_mask, topk_ids
         )
