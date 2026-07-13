@@ -1,5 +1,6 @@
 """MoE GEMM stage1/stage2 kernel builders (FLIR MFMA, mxfp4/mxfp8)."""
 
+import os
 from typing import Optional
 
 import flydsl.compiler as flyc
@@ -3087,7 +3088,21 @@ def compile_mixed_moe_gemm2(
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}{cumul_tag}{xcd_tag}{acc_tag}"
     ).replace("-", "_")
-    lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
+    _single_x_bytes = int(tile_m) * int(lds_stride) * int(a_elem_bytes)
+    # Deep software pipeline: use S X-LDS buffers and prefetch the activation tile
+    # (S-1) ahead (instead of the 2-buffer / 1-ahead ping-pong). Keeps the
+    # load/compute overlap intact (unlike the rejected full-K single-barrier
+    # variant) and gives the fp4 dequant/scale more lead time before its MFMA.
+    # S from SGLANG_MOE2_PIPE (default 2 = baseline). Enabled only when there are
+    # >= S K-tiles and the S buffers fit in LDS.
+    _pipe_stages = int(os.environ.get("SGLANG_MOE2_PIPE", "2") or "2")
+    pipe_deep = (
+        _pipe_stages >= 3
+        and int(num_k_tiles_per_batch) >= _pipe_stages
+        and _pipe_stages * _single_x_bytes <= 160 * 1024
+    )
+    n_x_buffers = _pipe_stages if pipe_deep else 2
+    lds_x_bytes = n_x_buffers * _single_x_bytes
     lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
     lds_tid_bytes = int(tile_m) * 4
     lds_tw_bytes = (int(tile_m) * 4) if bool(doweight_stage2) else 0
@@ -3239,7 +3254,7 @@ def compile_mixed_moe_gemm2(
                 else None
             )
 
-            lds_x_b = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
+            lds_x_b = n_x_buffers * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
             lds_out_b = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
             lds_tid_off = max(lds_x_b, lds_out_b)
             lds_tid = SmemPtr(
@@ -4137,6 +4152,9 @@ def compile_mixed_moe_gemm2(
                 lds_base_cur = arith.index(0)
                 lds_base_nxt = lds_tile_elems
 
+                def lds_base_k(kk):
+                    return arith.index(int(kk) * int(tile_m) * int(lds_stride))
+
                 rocdl.sched_barrier(0)
 
                 def hot_loop_scheduler():
@@ -4282,6 +4300,16 @@ def compile_mixed_moe_gemm2(
                 if const_expr(r216_defer_tid):
                     emit_tid_lds_prologue()
                     rocdl.sched_barrier(0)
+                if const_expr(pipe_deep):
+                    # stage tiles 1..S-2 into buffers 1..S-2 as well, so the per-tile
+                    # loop below can run (S-1) K-tiles ahead from the first iteration.
+                    for _pk in range_constexpr(1, n_x_buffers - 1):
+                        _pk_off = arith.index(int(_pk) * int(tile_k))
+                        if const_expr(use_async_copy):
+                            prefetch_x_to_lds(_pk_off, lds_base_k(_pk))
+                        else:
+                            _xrp = load_x_tile(_pk_off)
+                            store_x_tile_to_lds(_xrp, lds_base_k(_pk))
                 gpu.barrier()
 
                 acc = [acc_init] * num_acc_n * m_repeat
@@ -4323,7 +4351,77 @@ def compile_mixed_moe_gemm2(
                     """Create a b_hi_loader callable for a given base_k."""
                     return lambda bk=base_k: load_b_tile_hi(bk)
 
-                if const_expr(k_main2_py > 0):
+                if const_expr(pipe_deep):
+                    # S-buffer, prefetch-(S-1)-ahead per-tile pipeline. X for tile
+                    # k+(S-1) is staged while computing tile k; B/scale/A-packs for
+                    # tile k+1 are prefetched one ahead. One barrier per tile (same as
+                    # baseline) but the deeper prefetch gives fp4 dequant/scale extra
+                    # lead time before its MFMA.
+                    _nk = int(num_k_tiles_per_batch)
+                    _S = int(n_x_buffers)
+                    b_cur_r = b_cur
+                    a_sc = a_scale_pong
+                    b_sc = b_scale_pong
+                    a0 = a0_prefetch_pong
+                    a1 = a1_prefetch_pong
+                    cur_bk = k0_bk
+                    for _k in range_constexpr(_nk):
+                        if const_expr(_k + _S - 1 < _nk):
+                            _o2 = arith.index((_k + _S - 1) * int(tile_k))
+                            if const_expr(use_async_copy):
+                                prefetch_x_to_lds(_o2, lds_base_k((_k + _S - 1) % _S))
+                            else:
+                                _xr2 = load_x_tile(_o2)
+                                store_x_tile_to_lds(_xr2, lds_base_k((_k + _S - 1) % _S))
+                        if const_expr(_k + 1 < _nk):
+                            _n1p = (_k + 1) * int(tile_k)
+                            _n1_off = arith.index(_n1p)
+                            _n1_bk = _n1_off // b_byte_div
+                            _b_n = (
+                                load_b_tile_lo(_n1_bk)
+                                if b_split_enabled
+                                else load_b_tile(_n1_bk)
+                            )
+                            _asc_n, _bsc_n = prefetch_ab_scale_tile(
+                                k_base(_n1p), k_shift_bits(_n1p)
+                            )
+                            _a0_n = lds_load_packs_k64(
+                                row_a_lds, col_offset_base, lds_base_k((_k + 1) % _S)
+                            )
+                            _a1_n = (
+                                lds_load_packs_k64(
+                                    row_a_lds, a1_col_base, lds_base_k((_k + 1) % _S)
+                                )
+                                if pack_K >= 2
+                                else None
+                            )
+                        _is_last = _k == _nk - 1
+                        acc, _epi = compute_tile(
+                            acc,
+                            b_cur_r,
+                            lds_base_k(_k % _S),
+                            a_sc,
+                            b_sc,
+                            a0_prefetch=a0,
+                            a1_prefetch=a1,
+                            prefetch_epilogue=_is_last,
+                            ku_count=(tail_ku_s2 if _is_last else None),
+                            b_hi_loader=(
+                                make_b_hi_loader(cur_bk) if b_split_enabled else None
+                            ),
+                        )
+                        if const_expr(_is_last):
+                            epilogue_pf = _epi
+                        gpu.barrier()
+                        if const_expr(_k + 1 < _nk):
+                            b_cur_r = _b_n
+                            a_sc = _asc_n
+                            b_sc = _bsc_n
+                            a0 = _a0_n
+                            a1 = _a1_n
+                            cur_bk = _n1_bk
+
+                if const_expr(not pipe_deep and k_main2_py > 0):
                     for k_iv_py in range_constexpr(0, k_main2_py, tile_k * 2):
                         k_iv = arith.index(k_iv_py)
                         next_k1 = k_iv + tile_k
@@ -4413,7 +4511,9 @@ def compile_mixed_moe_gemm2(
                             else None
                         )
 
-                if const_expr(odd_k_tiles):
+                if const_expr(pipe_deep):
+                    pass
+                elif const_expr(odd_k_tiles):
                     acc, epilogue_pf = compute_tile(
                         acc,
                         b_pong,
