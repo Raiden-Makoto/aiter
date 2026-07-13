@@ -650,11 +650,21 @@ def _s2_args_fp4(
     dev,
     bias=None,
     stream=None,
+    done=None,
+    fused_out=None,
 ):
     _bias = (
         bias.view(-1)
         if bias is not None
         else torch.empty(0, device=dev, dtype=torch.float32)
+    )
+    # Fused gemm2+combine (SGLANG_MOE2_FUSED): done-counter + final out buffers.
+    # Always passed (kernel ABI is fixed); dummies when not fused.
+    _done = done if done is not None else torch.empty(0, device=dev, dtype=torch.int32)
+    _fused_out = (
+        fused_out
+        if fused_out is not None
+        else torch.empty(0, device=dev, dtype=target.dtype)
     )
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -669,6 +679,8 @@ def _s2_args_fp4(
         _ptr_view_safe(sorted_weights),
         _ptr_view_safe(num_valid_ids),
         _ptr_view_safe(_bias),
+        _ptr_view_safe(_done),
+        _ptr_view_safe(_fused_out),
         token_num,
         n_in,
         k_in,
@@ -1612,6 +1624,25 @@ def flydsl_moe_stage2(
                 dtype=out.dtype,
             )
 
+    # Fused gemm2+combine (SGLANG_MOE2_FUSED): allocate the zeroed per-(token,n-tile)
+    # done-counter and the fused final-out buffer. Only for reduce mode.
+    _fused_active = (
+        os.environ.get("SGLANG_MOE2_FUSED", "0") == "1"
+        and not accumulate
+        and not return_per_slot
+    )
+    if _fused_active:
+        _n_tiles = (model_dim + tile_n - 1) // tile_n
+        fused_done = torch.zeros(
+            token_num * _n_tiles, device=out.device, dtype=torch.int32
+        )
+        fused_out_buf = torch.empty(
+            token_num * model_dim, device=out.device, dtype=out.dtype
+        )
+    else:
+        fused_done = None
+        fused_out_buf = None
+
     if use_mx_gemm:
         args = _s2_args_fp4(
             target,
@@ -1629,6 +1660,8 @@ def flydsl_moe_stage2(
             m_blocks,
             dev,
             bias=bias,
+            done=fused_done,
+            fused_out=fused_out_buf,
         )
     else:
         args = _s2_args_std(

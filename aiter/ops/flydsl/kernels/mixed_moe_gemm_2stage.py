@@ -3103,6 +3103,19 @@ def compile_mixed_moe_gemm2(
     )
     n_x_buffers = _pipe_stages if pipe_deep else 2
     lds_x_bytes = n_x_buffers * _single_x_bytes
+    # Fused gemm2+combine megakernel (SGLANG_MOE2_FUSED=1): the persistent gemm2
+    # WGs, after draining their gemm2 tiles, work-steal combine (topk-sum) jobs
+    # and spin on a per-(token, n-tile) done-counter set by the reduce epilogue,
+    # so combine overlaps gemm2's idle cycles on the same CUs (CDNA4 has no
+    # cross-kernel PDL). Only valid for reduce mode (accumulate=False) + cshuffle.
+    fused_combine = (
+        os.environ.get("SGLANG_MOE2_FUSED", "0") == "1"
+        and not bool(accumulate)
+        and bool(_use_cshuffle_epilog)
+        and bool(persistent)
+    )
+    # n-tiles across the output (model_dim) dimension; done-counter is [token, n_tiles].
+    _n_tiles_fused = (int(model_dim) + int(tile_n) - 1) // int(tile_n)
     lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
     lds_tid_bytes = int(tile_m) * 4
     lds_tw_bytes = (int(tile_m) * 4) if bool(doweight_stage2) else 0
@@ -3130,6 +3143,8 @@ def compile_mixed_moe_gemm2(
             arg_sorted_weights: fx.Pointer,
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
+            arg_done: fx.Pointer,
+            arg_fused_out: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -3298,6 +3313,21 @@ def compile_mixed_moe_gemm2(
                 )
             out_nbytes_i32 = arith.index_cast(T.i32, out_nbytes_idx)
             out_rsrc = ptr_buffer_resource(arg_out, out_nbytes_i32)
+
+            if const_expr(fused_combine):
+                c_n_tiles_f = arith.constant(_n_tiles_fused, index=True)
+                done_nbytes_idx = (
+                    tokens_in * c_n_tiles_f * arith.constant(4, index=True)
+                )
+                done_rsrc = ptr_buffer_resource(
+                    arg_done, arith.index_cast(T.i32, done_nbytes_idx)
+                )
+                fout_nbytes_idx = (
+                    tokens_in * n_in * arith.constant(out_elem_bytes, index=True)
+                )
+                fout_rsrc = ptr_buffer_resource(
+                    arg_fused_out, arith.index_cast(T.i32, fout_nbytes_idx)
+                )
 
             numids_rsrc = ptr_buffer_resource(
                 arg_num_valid_ids, arith.constant(4, type=T.i32)
@@ -4772,6 +4802,56 @@ def compile_mixed_moe_gemm2(
                 )
                 rocdl.s_setprio(0)
 
+                if const_expr(fused_combine):
+                    # Producer signal: each valid row is one (token t, slot s) written
+                    # at n-tile `by`. Drain outstanding writes, then atomically bump
+                    # done[t*n_tiles + by] (release, agent) so consumers can start the
+                    # topk-sum for (t, by) once the counter hits topk.
+                    rocdl.s_waitcnt(0)
+                    _one_i32 = arith.constant(1, type=T.i32)
+                    _c_nt = arith.constant(_n_tiles_fused, index=True)
+                    _c4 = arith.constant(4, index=True)
+                    _done_base_i64 = arith.index_cast(T.i64, fx.ptrtoint(arg_done))
+                    _done_base_idx = arith.index_cast(T.index, _done_base_i64)
+                    _tid_lt_m = arith.cmpi(
+                        CmpIPredicate.ult, tx, arith.constant(tile_m, index=True)
+                    )
+                    _if_p = scf.IfOp(_tid_lt_m)
+                    with ir.InsertionPoint(_if_p.then_block):
+                        _row = bx_m + tx
+                        _fused = memref.load(lds_tid, [tx])
+                        _row_i32 = arith.index_cast(T.i32, _row)
+                        _t = _fused & mask24_i32
+                        _s = arith.shrui(_fused, arith.constant(24, type=T.i32))
+                        _valid = arith.andi(
+                            arith.cmpi(CmpIPredicate.ult, _row_i32, num_valid_i32),
+                            arith.andi(
+                                arith.cmpi(CmpIPredicate.ult, _t, tokens_i32),
+                                arith.cmpi(CmpIPredicate.ult, _s, topk_i32_v),
+                            ),
+                        )
+                        _if_v = scf.IfOp(_valid)
+                        with ir.InsertionPoint(_if_v.then_block):
+                            _t_idx = arith.index_cast(T.index, _t)
+                            _elem = _t_idx * _c_nt + by
+                            _byte = _done_base_idx + _elem * _c4
+                            _ptr = idx_to_llvm_ptr(_byte)
+                            _pv = _ptr._value if hasattr(_ptr, "_value") else _ptr
+                            _ov = (
+                                _one_i32._value
+                                if hasattr(_one_i32, "_value")
+                                else _one_i32
+                            )
+                            llvm.AtomicRMWOp(
+                                llvm.AtomicBinOp.add,
+                                _pv,
+                                _ov,
+                                llvm.AtomicOrdering.release,
+                                syncscope="agent",
+                            )
+                            scf.YieldOp([])
+                        scf.YieldOp([])
+
             all_valid = arith.andi(blk_valid, arith.andi(exp_valid, tile_has_tokens))
 
             if const_expr(persistent):
@@ -4828,6 +4908,8 @@ def compile_mixed_moe_gemm2(
         arg_sorted_weights: fx.Pointer,
         arg_num_valid_ids: fx.Pointer,
         arg_bias: fx.Pointer,
+        arg_done: fx.Pointer,
+        arg_fused_out: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -4867,6 +4949,8 @@ def compile_mixed_moe_gemm2(
             arg_sorted_weights,
             arg_num_valid_ids,
             arg_bias,
+            arg_done,
+            arg_fused_out,
             i32_tokens_in,
             i32_n_in,
             i32_k_in,
