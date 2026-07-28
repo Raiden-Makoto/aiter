@@ -38,6 +38,7 @@ using PipelineVersion = ck::BlockGemmPipelineVersion;
 
 const auto V1 = ck::BlockGemmPipelineVersion::v1;
 const auto V3 = ck::BlockGemmPipelineVersion::v3;
+const auto V5 = ck::BlockGemmPipelineVersion::v5;
 
 using CK_Dtype = std::variant<I4, I8, I32, F16, B16, F8, F32, FP4X2>;
 
