@@ -1,23 +1,26 @@
 import math
+
 import torch
 import triton
+
+from aiter.ops.quant import per_token_quant_hip
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
-    generate_batched_gemm_a16w8_inputs as generate_batched_gemm_a8w8_per_token_group_inputs,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    batched_model_benchmark_shapes,
+    get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
-    batched_model_benchmark_shapes,
     print_vgpr,
-    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+    generate_batched_gemm_a16w8_inputs as generate_batched_gemm_a8w8_per_token_group_inputs,
 )
 
 
@@ -31,8 +34,11 @@ def bench_gemm_fn(
     group_size: int,
     has_bias: bool,
     transpose_bm: bool,
+    ptpc_mode: str,
 ):
     c_dtype = torch.bfloat16
+    if ptpc_mode != "none":
+        assert transpose_bm, "PTPC benchmark modes require --transpose-bm"
     x, weight, w_scale, bias, y = generate_batched_gemm_a8w8_per_token_group_inputs(
         batch,
         M,
@@ -55,9 +61,15 @@ def bench_gemm_fn(
     )
     mem_write = y.numel() * y.element_size()
     mem = mem_read + mem_write
+    y_ptpc = torch.empty(
+        (M, batch * N), dtype=weight.dtype, device=x.device
+    )
+    y_scale = torch.empty((M, 1), dtype=torch.float32, device=x.device)
+    row_amax = torch.zeros((M,), dtype=torch.float32, device=x.device)
+    row_counter = torch.zeros((M,), dtype=torch.int32, device=x.device)
 
     def fn():
-        return batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+        result = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             x,
             weight,
             w_scale,
@@ -66,7 +78,17 @@ def bench_gemm_fn(
             dtype=c_dtype,
             YQ=y,
             transpose_bm=transpose_bm,
+            emit_ptpc=ptpc_mode == "fused",
+            YQ_ptpc=y_ptpc,
+            y_scale=y_scale,
+            row_amax=row_amax,
+            row_counter=row_counter,
         )
+        if ptpc_mode == "reference":
+            return per_token_quant_hip(
+                y.reshape(M, batch * N), quant_dtype=weight.dtype
+            )
+        return result
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
 
@@ -117,6 +139,7 @@ def run_model_benchmark(args):
             args.group_size,
             not args.no_bias,
             args.transpose_bm,
+            args.ptpc_mode,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -143,6 +166,7 @@ def run_shape_benchmark(args):
             args.group_size,
             not args.no_bias,
             args.transpose_bm,
+            args.ptpc_mode,
         )
 
     bench_batched_gemm_a8w8_per_token_group_prequant_w_per_batched_tensor_quant.run(
@@ -182,6 +206,12 @@ def parse_args(args: list[str] | None = None):
         default=False,
         dest="transpose_bm",
         help="Transpose batch and M dimensions in the output tensor.",
+    )
+    parser.add_argument(
+        "--ptpc-mode",
+        choices=["none", "reference", "fused"],
+        default="none",
+        help="Benchmark BF16 output, BMM+PTPC quant, or fused PTPC output.",
     )
     return get_ff_args(parser, args=args)
 
