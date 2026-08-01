@@ -222,7 +222,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         tl.store(
             c_scale_ptr
             + offs_cm * stride_scale_m
-            + batch_id * stride_scale_b,
+            + (batch_id * num_pid_n + pid_n) * stride_scale_b,
             out_scale,
             mask=valid_m,
         )
