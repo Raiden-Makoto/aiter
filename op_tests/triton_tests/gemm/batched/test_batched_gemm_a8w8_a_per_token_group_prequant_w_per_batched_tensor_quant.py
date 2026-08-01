@@ -216,8 +216,10 @@ def test_batched_gemm_group_quant_output(m, batch, n, transpose_scale):
         bf16.flatten(1),
         quant_dtype=aiter.dtypes.fp8,
         group_size=128,
-        transpose_scale=transpose_scale,
+        transpose_scale=False,
     )
+    if transpose_scale:
+        expected_scale = expected_scale.T.contiguous().T
     actual, actual_scale = (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             x,
