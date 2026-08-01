@@ -779,7 +779,15 @@ namespace py = pybind11;
           py::arg("w_scale"),                          \
           py::arg("Out"),                              \
           py::arg("preshuffleB") = true,               \
-          py::arg("kernelName")  = "");
+          py::arg("kernelName")  = "");                 \
+    m.def("gemm_a8w8_mixedscale_bpreshuffle_cktile",   \
+          &gemm_a8w8_mixedscale_bpreshuffle_cktile,    \
+          "fp8 mixed-scale gemm cktile",               \
+          py::arg("XQ"),                               \
+          py::arg("WQ"),                               \
+          py::arg("x_scale"),                          \
+          py::arg("w_scale"),                          \
+          py::arg("Out"));
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_CKTILE_TUNE_PYBIND \
     m.def("gemm_a8w8_blockscale_bpreshuffle_cktile_tune",   \
