@@ -111,7 +111,7 @@ torch::Tensor gemm_a8w8_mixedscale_bpreshuffle(torch::Tensor& XQ,
     using MixedGemm = DeviceGemmHelperF8MixedScaleBPreshuffle<
         F32,
         B16,
-        512,
+        256,
         16,
         64,
         256,
