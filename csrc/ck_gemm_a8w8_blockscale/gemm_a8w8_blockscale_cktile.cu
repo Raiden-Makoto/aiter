@@ -122,8 +122,8 @@ torch::Tensor gemm_a8w8_mixedscale_bpreshuffle_cktile(torch::Tensor& XQ,
                 "mixed-scale CKTile GEMM currently supports K=4096");
     TORCH_CHECK(x_scale.sizes() == torch::IntArrayRef({M, K / 128}),
                 "x_scale must have shape [M, K/128]");
-    TORCH_CHECK(w_scale.sizes() == torch::IntArrayRef({N, 1}),
-                "w_scale must have shape [N, 1]");
+    TORCH_CHECK(w_scale.sizes() == torch::IntArrayRef({N, K / 128}),
+                "w_scale must have shape [N, K/128]");
     TORCH_CHECK(Y.sizes() == torch::IntArrayRef({M, N}), "Y must have shape [M, N]");
     TORCH_CHECK(x_scale.is_contiguous() && w_scale.is_contiguous(),
                 "mixed-scale scales must be contiguous");
@@ -131,7 +131,7 @@ torch::Tensor gemm_a8w8_mixedscale_bpreshuffle_cktile(torch::Tensor& XQ,
     using MixedAQuantGroupSize =
         ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>;
     using MixedBQuantGroupSize =
-        ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 4096>>;
+        ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>;
     using MixedGemmConfig =
         TileGemmConfig<16,
                        128,
