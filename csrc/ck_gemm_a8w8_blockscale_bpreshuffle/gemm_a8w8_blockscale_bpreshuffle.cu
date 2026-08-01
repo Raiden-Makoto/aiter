@@ -90,3 +90,51 @@ torch::Tensor gemm_a8w8_blockscale_bpreshuffle(torch::Tensor& XQ,
     }
     return Y;
 }
+
+torch::Tensor gemm_a8w8_mixedscale_bpreshuffle(torch::Tensor& XQ,
+                                               torch::Tensor& WQ,
+                                               torch::Tensor& x_scale,
+                                               torch::Tensor& b_block_scale,
+                                               torch::Tensor& w_channel_scale,
+                                               torch::Tensor& Y)
+{
+    const int M = XQ.size(0);
+    const int N = WQ.size(0);
+    const int K = XQ.size(1);
+
+    TORCH_CHECK(K == 4096 && WQ.size(1) == K,
+                "mixed-scale XDL GEMM currently supports K=4096");
+    TORCH_CHECK(x_scale.numel() == M * (K / 128),
+                "x_scale must contain M*K/128 elements");
+    TORCH_CHECK(b_block_scale.sizes() == torch::IntArrayRef({N / 128, K / 128}),
+                "b_block_scale must have shape [N/128, K/128]");
+    TORCH_CHECK(w_channel_scale.sizes() == torch::IntArrayRef({N, 1}),
+                "w_channel_scale must have shape [N, 1]");
+    TORCH_CHECK(Y.sizes() == torch::IntArrayRef({M, N}), "Y must have shape [M, N]");
+
+    using MixedGemm = DeviceGemmHelperF8MixedScaleBPreshuffle<
+        F32,
+        B16,
+        256,
+        16,
+        128,
+        128,
+        8,
+        16,
+        16,
+        16,
+        1,
+        2,
+        S<16, 16, 1>,
+        S<8, 32, 1>,
+        1,
+        2,
+        S<1, 16, 1, 16>,
+        S<8>,
+        ck::BlockGemmPipelineScheduler::Intrawave,
+        ck::BlockGemmPipelineVersion::v1,
+        ck::tensor_operation::device::GemmSpecialization::MNKPadding>;
+
+    return gemm_a8w8_mixedscale_bpreshuffle_impl<F32, B16, MixedGemm>(
+        XQ, WQ, x_scale, b_block_scale, w_channel_scale, Y);
+}
