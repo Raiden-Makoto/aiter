@@ -466,3 +466,43 @@ def gemm_a8w8_blockscale_preshuffle(
         )
 
     return y
+
+
+def gemm_a8w8_group_channel_preshuffle(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+):
+    """FP8 GEMM with group-128 activation and per-channel weight scales.
+
+    The preshuffled weight uses the same physical layout as the blockscale
+    kernel. A zero-stride expansion repeats each channel scale across K groups,
+    so the Triton scale loop applies one weight scale for the complete row
+    without materializing an ``[N, K/128]`` tensor.
+    """
+
+    m, k = x.shape
+    n = w.shape[0] * 16
+    k_groups = k // 128
+    assert k % 128 == 0
+    assert x_scale.shape == (m, k_groups)
+    assert w_scale.shape == (n, 1)
+    assert x_scale.is_contiguous()
+    assert w_scale.is_contiguous()
+
+    expanded_w_scale = w_scale.expand(n, k_groups)
+    return gemm_a8w8_blockscale_preshuffle(
+        x,
+        w,
+        x_scale,
+        expanded_w_scale,
+        dtype=dtype,
+        y=y,
+        config=config,
+        is_x_scale_tranposed=False,
+        backend="triton",
+    )

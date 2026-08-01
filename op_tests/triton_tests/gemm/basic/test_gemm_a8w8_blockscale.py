@@ -9,6 +9,7 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle,
+    gemm_a8w8_group_channel_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gfx950_gemm_a8w8_blockscale,
@@ -133,6 +134,34 @@ def generate_gemm_a8w8_blockscale_inputs(
         y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
 
     return x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y
+
+
+@pytest.mark.parametrize("m,n,k", [(1, 6144, 4096), (16, 6144, 4096)])
+def test_gemm_group_activation_channel_weight(m, n, k):
+    torch.manual_seed(2026 + m)
+    x = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
+
+    x_view = x.view(m, k // 128, 128)
+    x_scale = x_view.abs().float().amax(dim=-1) / torch.finfo(e4m3_type).max
+    x_q = (x_view.float() / x_scale[..., None]).to(e4m3_type).view(m, k)
+    w_scale = weight.abs().float().amax(dim=-1, keepdim=True) / torch.finfo(
+        e4m3_type
+    ).max
+    w_q = (weight.float() / w_scale).to(e4m3_type)
+    w_q_shuffled = shuffle_weight(w_q, (16, 16)).reshape(n // 16, k * 16)
+
+    actual = gemm_a8w8_group_channel_preshuffle(
+        x_q,
+        w_q_shuffled,
+        x_scale,
+        w_scale,
+    )
+    expected = F.linear(
+        (x_q.view(m, k // 128, 128).float() * x_scale[..., None]).view(m, k),
+        w_q.float() * w_scale,
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, rtol=0.1, atol=0.1)
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,8 @@ import pytest
 import torch
 import triton
 
+import aiter
+from aiter.ops.quant import per_group_quant_hip
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
@@ -180,3 +182,48 @@ def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
     )
 
     triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)
+
+
+@pytest.mark.parametrize("m", [1, 4, 8, 16, 32, 64])
+def test_batched_gemm_group_quant_output(m):
+    batch, n, k = 32, 128, 512
+    x, weight, w_scale, _, _ = generate_batched_gemm_a16w8_inputs(
+        batch,
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        has_bias=False,
+        output=False,
+        transpose_bm=True,
+    )
+    x = x.transpose(0, 1).contiguous()
+
+    bf16 = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+        x,
+        weight,
+        w_scale,
+        YQ=torch.empty(
+            (m, batch, n), dtype=torch.bfloat16, device=x.device
+        ),
+        transpose_bm=True,
+        transpose_bm_in=True,
+    )
+    expected, expected_scale = per_group_quant_hip(
+        bf16.flatten(1),
+        quant_dtype=aiter.dtypes.fp8,
+        group_size=128,
+        transpose_scale=False,
+    )
+    actual, actual_scale = (
+        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+            x,
+            weight,
+            w_scale,
+            transpose_bm=True,
+            transpose_bm_in=True,
+            emit_group_quant=True,
+        )
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=1e-6)

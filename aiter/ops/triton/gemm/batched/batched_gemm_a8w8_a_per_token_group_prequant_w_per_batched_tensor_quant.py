@@ -22,6 +22,8 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     transpose_bm: bool | None = False,
     transpose_bm_in: bool | None = False,
     config: dict | None = None,
+    emit_group_quant: bool = False,
+    y_scale: torch.Tensor | None = None,
 ):
     """
     Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
@@ -41,9 +43,12 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         transpose_bm (Optional[bool]): Transpose batch and M dimensions in output.
         transpose_bm_in (Optional[bool]): Transpose batch and M dimensions in input.
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M).
+        emit_group_quant (bool): Emit group-128 FP8 output instead of BF16.
+        y_scale (Optional[torch.Tensor]): Pre-allocated FP32 output scales (M, B).
 
     Returns:
-        torch.Tensor: Output batch with shape (B, M, N) or (M, B, N) if transpose_bm=True.
+        torch.Tensor: Output batch, or ``(YQ.view(M, B*N), y_scale)`` when
+        ``emit_group_quant=True``.
     """
 
     # Check constraints.
@@ -70,7 +75,16 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     WQ = WQ.transpose(1, 2)
 
     has_bias = bias is not None
-    if YQ is None:
+    if emit_group_quant:
+        assert transpose_bm, "group-quant output requires transpose_bm=True"
+        assert N == 128, "group-quant output requires N=128"
+        if YQ is None:
+            YQ = torch.empty((M, B, N), dtype=WQ.dtype, device=X.device)
+        if y_scale is None:
+            y_scale = torch.empty((M, B), dtype=torch.float32, device=X.device)
+        assert YQ.shape == (M, B, N) and YQ.dtype == WQ.dtype
+        assert y_scale.shape == (M, B) and y_scale.dtype == torch.float32
+    elif YQ is None:
         if transpose_bm:
             YQ = torch.empty((M, B, N), dtype=dtype, device=X.device)
         else:
@@ -87,6 +101,10 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
 
     if config is None:
         config, _ = _get_config(M, N, K)
+    else:
+        config = dict(config)
+    if emit_group_quant:
+        config["BLOCK_SIZE_N"] = 128
     config["BLOCK_SIZE_K"] = group_size
     config["kpack"] = 1
 
@@ -107,6 +125,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         X,
         WQ,
         YQ,
+        y_scale if emit_group_quant else YQ,
         w_scale,
         bias,
         M,
@@ -121,11 +140,16 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         YQ.stride(0) if not transpose_bm else YQ.stride(1),
         YQ.stride(1) if not transpose_bm else YQ.stride(0),
         YQ.stride(2),
+        y_scale.stride(0) if emit_group_quant else YQ.stride(0),
+        y_scale.stride(1) if emit_group_quant else YQ.stride(1),
         bias.stride(0) if has_bias else 0,
         has_bias,
+        EMIT_GROUP_QUANT=emit_group_quant,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
         **config,
     )
 
+    if emit_group_quant:
+        return YQ.view(M, B * N), y_scale
     return YQ
