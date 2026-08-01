@@ -323,6 +323,32 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
 ) -> torch.Tensor: ...
 
 
+def gen_gemm_a8w8_mixedscale_fake_tensors(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    b_block_scale: torch.Tensor,
+    w_channel_scale: torch.Tensor,
+    Out: torch.Tensor,
+) -> torch.Tensor:
+    return Out
+
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_bpreshuffle",
+    fc_name="gemm_a8w8_mixedscale_bpreshuffle",
+    gen_fake=gen_gemm_a8w8_mixedscale_fake_tensors,
+)
+def gemm_a8w8_mixedscale_bpreshuffle(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    b_block_scale: torch.Tensor,
+    w_channel_scale: torch.Tensor,
+    Out: torch.Tensor,
+) -> torch.Tensor: ...
+
+
 @compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle_cktile",
     fc_name="gemm_a8w8_blockscale_bpreshuffle_cktile",

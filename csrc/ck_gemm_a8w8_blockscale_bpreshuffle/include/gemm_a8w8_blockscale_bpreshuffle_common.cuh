@@ -64,6 +64,18 @@ using AElementOp   = PassThrough;
 using BElementOp   = PassThrough;
 using CDEElementOp = PassThrough;
 
+using MixedDsDataType = ck::Tuple<F32>;
+using MixedDsLayout   = ck::Tuple<Col>;
+
+struct MultiplyChannelScale
+{
+    template <typename E, typename C, typename D>
+    __host__ __device__ constexpr void operator()(E& e, const C& c, const D& d) const
+    {
+        e = ck::type_convert<E>(ck::type_convert<float>(c) * ck::type_convert<float>(d));
+    }
+};
+
 template <typename AB1DataType,
           typename EDataType,
           ck::index_t BlockSize,
@@ -114,6 +126,81 @@ using DeviceGemmHelperF8BlockScaleBPreshuffle =
           BlkGemmPipelineVer, A0DataType>;
 // clang-format on
 
+template <typename AB1DataType,
+          typename EDataType,
+          ck::index_t BlockSize,
+          ck::index_t MPerBlock,
+          ck::index_t NPerBlock,
+          ck::index_t KPerBlock,
+          ck::index_t AK1,
+          ck::index_t BK1,
+          ck::index_t MPerXDL,
+          ck::index_t NPerXDL,
+          ck::index_t MXdlPerWave,
+          ck::index_t NXdlPerWave,
+          typename ABlockTransferThreadClusterLengths_AK0_M_AK1,
+          typename BBlockTransferThreadClusterLengths_BK0_N_BK1,
+          ck::index_t CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
+          ck::index_t CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
+          typename CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock,
+          typename CDEShuffleBlockTransferScalarPerVectors,
+          ck::BlockGemmPipelineScheduler BlkGemmPipeSched =
+              ck::BlockGemmPipelineScheduler::Intrawave,
+          ck::BlockGemmPipelineVersion BlkGemmPipelineVer = ck::BlockGemmPipelineVersion::v1,
+          auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default>
+using DeviceGemmHelperF8MixedScaleBPreshuffle =
+    ck::tensor_operation::device::DeviceGemmMultiD_BlockScale_Xdl_CShuffle_V3_BPreshuffle<
+        A0Layout,
+        B0Layout,
+        MixedDsLayout,
+        ELayout,
+        A0DataType,
+        AB1DataType,
+        B0DataType,
+        AB1DataType,
+        MixedDsDataType,
+        EDataType,
+        AccDataType,
+        CShuffleDataType,
+        AElementOp,
+        BElementOp,
+        MultiplyChannelScale,
+        GemmSpec,
+        BlockSize,
+        1,
+        128,
+        128,
+        MPerBlock,
+        NPerBlock,
+        KPerBlock,
+        AK1,
+        BK1,
+        MPerXDL,
+        NPerXDL,
+        MXdlPerWave,
+        NXdlPerWave,
+        ABlockTransferThreadClusterLengths_AK0_M_AK1,
+        S<1, 0, 2>,
+        S<1, 0, 2>,
+        2,
+        AK1,
+        AK1,
+        0,
+        BBlockTransferThreadClusterLengths_BK0_N_BK1,
+        S<1, 0, 2>,
+        S<1, 0, 2>,
+        2,
+        BK1,
+        BK1,
+        0,
+        CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
+        CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
+        CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock,
+        CDEShuffleBlockTransferScalarPerVectors,
+        BlkGemmPipeSched,
+        BlkGemmPipelineVer,
+        A0DataType>;
+
 template <typename DDataType, typename EDataType, typename DeviceGemmInstance>
 __forceinline__ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_impl(torch::Tensor& XQ,
                                                                     torch::Tensor& WQ,
@@ -159,6 +246,46 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_impl(torch::Tenso
 
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
+    invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
+    return Y;
+}
+
+template <typename DDataType, typename EDataType, typename DeviceGemmInstance>
+__forceinline__ torch::Tensor gemm_a8w8_mixedscale_bpreshuffle_impl(
+    torch::Tensor& XQ,
+    torch::Tensor& WQ,
+    torch::Tensor& x_scale,
+    torch::Tensor& b_block_scale,
+    torch::Tensor& w_channel_scale,
+    torch::Tensor& Y)
+{
+    const int M = XQ.size(0);
+    const int N = WQ.size(0);
+    const int K = XQ.size(1);
+
+    auto device_gemm = DeviceGemmInstance{};
+    auto invoker     = device_gemm.MakeInvoker();
+    auto argument    = device_gemm.MakeArgument(
+        XQ.data_ptr(),
+        WQ.data_ptr(),
+        std::array<const void*, 1>{
+            reinterpret_cast<DDataType*>(w_channel_scale.data_ptr())},
+        reinterpret_cast<EDataType*>(Y.data_ptr()),
+        M,
+        N,
+        K,
+        XQ.stride(-2),
+        WQ.stride(-2),
+        std::array<ck::index_t, 1>{0},
+        N,
+        reinterpret_cast<DDataType*>(x_scale.data_ptr()),
+        reinterpret_cast<DDataType*>(b_block_scale.data_ptr()),
+        AElementOp{},
+        BElementOp{},
+        MultiplyChannelScale{});
+
+    TORCH_CHECK(device_gemm.IsSupportedArgument(argument),
+                "This mixed-scale GEMM is not supported!");
     invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStream()});
     return Y;
 }
