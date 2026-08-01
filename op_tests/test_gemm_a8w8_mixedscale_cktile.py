@@ -30,13 +30,14 @@ def test_gemm_a8w8_mixedscale_cktile(m):
     )
     w_q_ref = w_q
     w_q = shuffle_weight(w_q_ref, (16, 16)).contiguous()
+    w_scale_expanded = w_scale.expand(n, k // 128).contiguous()
     out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
 
     actual = gemm_a8w8_mixedscale_bpreshuffle_cktile(
         x_q,
         w_q,
         x_scale,
-        w_scale,
+        w_scale_expanded,
         out,
     )
     expected = F.linear(
@@ -64,6 +65,7 @@ def test_gemm_a8w8_mixedscale_cktile_cuda_graph():
         quant_dtype=aiter.dtypes.fp8,
     )
     w_q = shuffle_weight(w_q, (16, 16)).contiguous()
+    w_scale = w_scale.expand(n, k // 128).contiguous()
     out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
 
     for _ in range(3):
