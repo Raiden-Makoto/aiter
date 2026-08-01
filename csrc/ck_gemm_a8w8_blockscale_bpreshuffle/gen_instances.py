@@ -339,5 +339,5 @@ if __name__ == "__main__":
         codegen.gen_instances(kernels_list)
     else:
         runtime_kernels = get_tune_dict(args.tune_file)
-        runtime_kernels[-2] = kernels_list[18]
+        runtime_kernels[18] = kernels_list[18]
         codegen.gen_instances(runtime_kernels)
