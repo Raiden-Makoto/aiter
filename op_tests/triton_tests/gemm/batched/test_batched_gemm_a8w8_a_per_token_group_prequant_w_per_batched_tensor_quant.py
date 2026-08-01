@@ -205,7 +205,7 @@ def test_batched_gemm_fused_ptpc_output(m, n):
     output = torch.empty((m, batch * n), dtype=weight.dtype, device=x.device)
     scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
     row_amax = torch.zeros((m,), dtype=torch.float32, device=x.device)
-    row_counter = torch.zeros((m,), dtype=torch.int32, device=x.device)
+    row_counter = torch.zeros((3 * m,), dtype=torch.int32, device=x.device)
 
     def run():
         return batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
@@ -254,7 +254,7 @@ def test_batched_gemm_fused_ptpc_output_cuda_graph_replay():
     output = torch.empty((m, batch * n), dtype=weight.dtype, device=x.device)
     scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
     row_amax = torch.zeros((m,), dtype=torch.float32, device=x.device)
-    row_counter = torch.zeros((m,), dtype=torch.int32, device=x.device)
+    row_counter = torch.zeros((3 * m,), dtype=torch.int32, device=x.device)
 
     def run():
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
