@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Optional
 import torch
 import triton
-
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel,
     _get_config,
-    _get_ptpc_config,
 )
 
 
@@ -16,18 +15,13 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     WQ: torch.Tensor,
     w_scale: torch.Tensor,
     group_size: int = 128,
-    bias: torch.Tensor | None = None,
-    dtype: torch.dtype | None = torch.bfloat16,
-    splitK: int | None = None,
-    YQ: torch.Tensor | None = None,
-    transpose_bm: bool | None = False,
-    transpose_bm_in: bool | None = False,
-    config: dict | None = None,
-    emit_ptpc: bool = False,
-    YQ_ptpc: torch.Tensor | None = None,
-    y_scale: torch.Tensor | None = None,
-    row_amax: torch.Tensor | None = None,
-    row_counter: torch.Tensor | None = None,
+    bias: Optional[torch.Tensor] = None,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    splitK: Optional[int] = None,
+    YQ: Optional[torch.Tensor] = None,
+    transpose_bm: Optional[bool] = False,
+    transpose_bm_in: Optional[bool] = False,
+    config: Optional[dict] = None,
 ):
     """
     Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
@@ -47,15 +41,9 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         transpose_bm (Optional[bool]): Transpose batch and M dimensions in output.
         transpose_bm_in (Optional[bool]): Transpose batch and M dimensions in input.
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M).
-        emit_ptpc (bool): Emit flattened FP8 output and one FP32 scale per M row.
-        YQ_ptpc (Optional[torch.Tensor]): Pre-allocated FP8 output with shape (M, B*N).
-        y_scale (Optional[torch.Tensor]): Pre-allocated FP32 scales with shape (M, 1).
-        row_amax (Optional[torch.Tensor]): Zero-initialized FP32 workspace with shape (M,).
-        row_counter (Optional[torch.Tensor]): Zero-initialized int32 workspace with shape (M,).
 
     Returns:
-        torch.Tensor: BF16/FP16 output, or ``(YQ_ptpc, y_scale)`` when
-        ``emit_ptpc=True``.
+        torch.Tensor: Output batch with shape (B, M, N) or (M, B, N) if transpose_bm=True.
     """
 
     # Check constraints.
@@ -98,37 +86,11 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
             ), "Output dimension error"
 
     if config is None:
-        config, _ = (
-            _get_ptpc_config(M, N, K) if emit_ptpc else _get_config(M, N, K)
-        )
-    else:
-        config = dict(config)
+        config, _ = _get_config(M, N, K)
     config["BLOCK_SIZE_K"] = group_size
     config["kpack"] = 1
 
-    if emit_ptpc:
-        assert transpose_bm, "PTPC output requires transpose_bm=True"
-        assert YQ.is_contiguous(), "PTPC BF16 scratch must be contiguous (M, B, N)"
-        if YQ_ptpc is None:
-            YQ_ptpc = torch.empty((M, B * N), dtype=WQ.dtype, device=X.device)
-        if y_scale is None:
-            y_scale = torch.empty((M, 1), dtype=torch.float32, device=X.device)
-        if row_amax is None:
-            row_amax = torch.zeros((M,), dtype=torch.float32, device=X.device)
-        if row_counter is None:
-            row_counter = torch.zeros((M,), dtype=torch.int32, device=X.device)
-        assert YQ_ptpc.shape == (M, B * N) and YQ_ptpc.is_contiguous()
-        assert y_scale.shape == (M, 1) and y_scale.dtype == torch.float32
-        assert row_amax.shape == (M,) and row_amax.dtype == torch.float32
-        assert row_counter.shape == (M,) and row_counter.dtype == torch.int32
-    else:
-        # Dead placeholders removed by the EMIT_PTPC constexpr specialization.
-        YQ_ptpc = YQ
-        y_scale = YQ
-        row_amax = YQ
-        row_counter = YQ
-
-    grid = lambda META: (
+    grid = lambda META: (  # noqa: E731
         B,
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
@@ -145,13 +107,8 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         X,
         WQ,
         YQ,
-        YQ_ptpc,
-        y_scale,
-        row_amax,
-        row_counter,
         w_scale,
         bias,
-        B,
         M,
         N,
         K,
@@ -164,17 +121,11 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         YQ.stride(0) if not transpose_bm else YQ.stride(1),
         YQ.stride(1) if not transpose_bm else YQ.stride(0),
         YQ.stride(2),
-        YQ_ptpc.stride(0),
-        YQ_ptpc.stride(1),
-        y_scale.stride(0),
         bias.stride(0) if has_bias else 0,
         has_bias,
-        EMIT_PTPC=emit_ptpc,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
         **config,
     )
 
-    if emit_ptpc:
-        return YQ_ptpc, y_scale
     return YQ

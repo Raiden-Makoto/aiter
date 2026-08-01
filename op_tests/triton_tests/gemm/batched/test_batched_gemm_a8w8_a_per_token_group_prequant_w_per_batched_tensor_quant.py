@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import pytest
 import torch
 import triton
-
-from aiter.ops.quant import per_token_quant_hip
+import pytest
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
-from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
+from typing import Union
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
@@ -19,7 +18,7 @@ def generate_batched_gemm_a16w8_inputs(
     M: int,
     N: int,
     K: int,
-    dtype: torch.dtype | str,
+    dtype: Union[torch.dtype, str],
     has_bias: bool,
     output: bool,
     layout: str = "TN",
@@ -140,8 +139,8 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(v**2, 128, 512) for v in range(7)]
-    x_vals += [(v**2, 512, 128) for v in range(7)]
+    x_vals += [(v**2, 128, 512) for v in range(0, 7)]
+    x_vals += [(v**2, 512, 128) for v in range(0, 7)]
     x_vals += [(1, 128, 1)]  # minimal case
     return x_vals
 
@@ -181,111 +180,3 @@ def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
     )
 
     triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)
-
-
-@pytest.mark.parametrize("m", [1, 4, 8, 16, 32])
-@pytest.mark.parametrize("n", [96, 128])
-def test_batched_gemm_fused_ptpc_output(m, n):
-    batch, k = 32, 512
-    x, weight, w_scale, _, _ = generate_batched_gemm_a16w8_inputs(
-        batch,
-        m,
-        n,
-        k,
-        torch.bfloat16,
-        has_bias=False,
-        output=False,
-        transpose_bm=True,
-    )
-    x = x.transpose(0, 1).contiguous()
-
-    scratch = torch.empty(
-        (m, batch, n), dtype=torch.bfloat16, device=x.device
-    )
-    output = torch.empty((m, batch * n), dtype=weight.dtype, device=x.device)
-    scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
-    row_amax = torch.zeros((m,), dtype=torch.float32, device=x.device)
-    row_counter = torch.zeros((m,), dtype=torch.int32, device=x.device)
-
-    def run():
-        return batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-            x,
-            weight,
-            w_scale,
-            group_size=128,
-            dtype=torch.bfloat16,
-            YQ=scratch,
-            transpose_bm=True,
-            transpose_bm_in=True,
-            emit_ptpc=True,
-            YQ_ptpc=output,
-            y_scale=scale,
-            row_amax=row_amax,
-            row_counter=row_counter,
-        )
-
-    for _ in range(3):
-        actual, actual_scale = run()
-        expected, expected_scale = per_token_quant_hip(
-            scratch.flatten(1), quant_dtype=weight.dtype
-        )
-        torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=1e-6)
-        torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
-        torch.testing.assert_close(row_amax, torch.zeros_like(row_amax))
-        torch.testing.assert_close(row_counter, torch.zeros_like(row_counter))
-
-
-def test_batched_gemm_fused_ptpc_output_cuda_graph_replay():
-    batch, m, n, k = 32, 4, 128, 512
-    x, weight, w_scale, _, _ = generate_batched_gemm_a16w8_inputs(
-        batch,
-        m,
-        n,
-        k,
-        torch.bfloat16,
-        has_bias=False,
-        output=False,
-        transpose_bm=True,
-    )
-    x = x.transpose(0, 1).contiguous()
-    scratch = torch.empty(
-        (m, batch, n), dtype=torch.bfloat16, device=x.device
-    )
-    output = torch.empty((m, batch * n), dtype=weight.dtype, device=x.device)
-    scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
-    row_amax = torch.zeros((m,), dtype=torch.float32, device=x.device)
-    row_counter = torch.zeros((m,), dtype=torch.int32, device=x.device)
-
-    def run():
-        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-            x,
-            weight,
-            w_scale,
-            group_size=128,
-            dtype=torch.bfloat16,
-            YQ=scratch,
-            transpose_bm=True,
-            transpose_bm_in=True,
-            emit_ptpc=True,
-            YQ_ptpc=output,
-            y_scale=scale,
-            row_amax=row_amax,
-            row_counter=row_counter,
-        )
-
-    run()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-
-    for _ in range(3):
-        graph.replay()
-        torch.cuda.synchronize()
-        expected, expected_scale = per_token_quant_hip(
-            scratch.flatten(1), quant_dtype=weight.dtype
-        )
-        torch.testing.assert_close(scale, expected_scale, rtol=0, atol=1e-6)
-        torch.testing.assert_close(output.float(), expected.float(), rtol=0, atol=0)
-        torch.testing.assert_close(row_amax, torch.zeros_like(row_amax))
-        torch.testing.assert_close(row_counter, torch.zeros_like(row_counter))

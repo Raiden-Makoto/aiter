@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton
 import triton.language as tl
-
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+import triton
 
 _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = make_kernel_repr(
     "_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel",
@@ -17,7 +17,6 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
         "GROUP_SIZE_M",
         "EVEN_K",
         "EVEN_MN",
-        "EMIT_PTPC",
         "cache_modifier",
     ],
 )
@@ -32,23 +31,18 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
 )
 @triton.jit(
     repr=_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr,
-    do_not_specialize=["M"],
+    do_not_specialize=["M", "N"],
 )
 def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
     c_ptr,
-    c_ptpc_ptr,
-    c_scale_ptr,
-    row_amax_ptr,
-    row_counter_ptr,
     b_scale_ptr,
     bias_ptr,
     # Matrix dimensions
-    B: tl.constexpr,
     M,
-    N: tl.constexpr,
+    N,
     K,
     # The stride variables represent how much to increase the ptr by when
     # moving by 1 element in a particular dimension. E.g. `stride_am` is
@@ -63,9 +57,6 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     stride_in_cb,
     stride_in_cm,
     stride_in_cn,
-    stride_ptpc_m,
-    stride_ptpc_n,
-    stride_scale_m,
     stride_in_biasb,
     # Meta-parameters
     HAS_BIAS: tl.constexpr,
@@ -77,7 +68,6 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     EVEN_MN: tl.constexpr,
-    EMIT_PTPC: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -172,7 +162,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         if EVEN_K:
             a = tl.load(a_ptrs)
             b = tl.load(b_ptrs, cache_modifier=cache_modifier)
@@ -211,87 +201,10 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         + stride_cn * offs_cn[None, :]
     )
     if EVEN_MN:
-        if EMIT_PTPC:
-            tl.store(c_ptrs, c, cache_modifier=".wt")
-        else:
-            tl.store(c_ptrs, c)
+        tl.store(c_ptrs, c)
     else:
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        if EMIT_PTPC:
-            tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
-        else:
-            tl.store(c_ptrs, c, mask=c_mask)
-
-    if EMIT_PTPC:
-        # The logical PTPC row spans every batch/head and N tile. Each GEMM
-        # program contributes its BF16-rounded local amax, then the final
-        # program for a row quantizes the complete contiguous (B*N) scratch row.
-        valid_m = offs_cm < M
-        valid_n = offs_cn < N
-        c_for_amax = tl.where(valid_n[None, :], tl.abs(c.to(tl.float32)), 0.0)
-        tile_amax = tl.max(c_for_amax, axis=1)
-        tl.atomic_max(
-            row_amax_ptr + offs_cm,
-            tile_amax,
-            mask=valid_m,
-            sem="relaxed",
-            scope="gpu",
-        )
-        _ = tl.inline_asm_elementwise(
-            asm="s_waitcnt vmcnt(0)\ns_mov_b32 $0, 0",
-            constraints="=s",
-            args=[],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-
-        # Every program in one M tile covers the same rows, so one scalar
-        # completion counter per pid_m identifies a common finalizer program.
-        # acq_rel makes all prior BF16 stores and amax atomics visible to it.
-        finished = tl.atomic_add(
-            row_counter_ptr + pid_m,
-            1,
-            sem="acq_rel",
-            scope="gpu",
-        )
-        expected_tiles = B * num_pid_n
-        if finished == expected_tiles - 1:
-            row_amax = tl.load(row_amax_ptr + offs_cm, mask=valid_m, other=1.0)
-            row_scale = tl.maximum(row_amax, 1.0e-10) / DTYPE_MAX
-            tl.store(
-                c_scale_ptr + offs_cm * stride_scale_m,
-                row_scale,
-                mask=valid_m,
-            )
-
-            for q_start in tl.static_range(0, B * N, BLOCK_SIZE_N):
-                offs_qn = q_start + tl.arange(0, BLOCK_SIZE_N)
-                q_mask = valid_m[:, None] & (offs_qn[None, :] < B * N)
-                bf16_row = tl.load(
-                    c_ptr + offs_cm[:, None] * stride_cm + offs_qn[None, :],
-                    mask=q_mask,
-                    other=0.0,
-                    cache_modifier=".cg",
-                )
-                quant_row = tl.clamp(
-                    bf16_row.to(tl.float32) / row_scale[:, None],
-                    DTYPE_MIN,
-                    DTYPE_MAX,
-                ).to(c_ptpc_ptr.dtype.element_ty)
-                tl.store(
-                    c_ptpc_ptr
-                    + offs_cm[:, None] * stride_ptpc_m
-                    + offs_qn[None, :] * stride_ptpc_n,
-                    quant_row,
-                    mask=q_mask,
-                    cache_modifier=".cs",
-                )
-
-            # The caller initializes these buffers once. Self-reset makes them
-            # safe for eager reuse and graph replay without captured memsets.
-            tl.store(row_amax_ptr + offs_cm, 0.0, mask=valid_m)
-            tl.store(row_counter_ptr + pid_m, 0)
+        tl.store(c_ptrs, c, mask=c_mask)
 
 
 def _get_config(
@@ -306,19 +219,3 @@ def _get_config(
         N,
         K,
     )
-
-
-def _get_ptpc_config(
-    M: int,
-    N: int,
-    K: int,
-):
-    if M > 64 or (N, K) != (128, 512):
-        return _get_config(M, N, K)
-    config, is_tuned = get_gemm_config(
-        "BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT-PTPC_OUTPUT",
-        M,
-        N,
-        K,
-    )
-    return (config, True) if is_tuned else _get_config(M, N, K)
