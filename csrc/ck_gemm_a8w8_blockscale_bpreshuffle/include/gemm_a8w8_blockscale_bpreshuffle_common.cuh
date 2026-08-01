@@ -65,7 +65,7 @@ using BElementOp   = PassThrough;
 using CDEElementOp = PassThrough;
 
 using MixedDsDataType = ck::Tuple<F32>;
-using MixedDsLayout   = ck::Tuple<Col>;
+using MixedDsLayout   = ck::Tuple<Row>;
 
 struct MultiplyChannelScale
 {
