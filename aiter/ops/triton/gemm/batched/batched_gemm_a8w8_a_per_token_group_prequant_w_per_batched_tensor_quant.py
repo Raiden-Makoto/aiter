@@ -51,7 +51,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         YQ_ptpc (Optional[torch.Tensor]): Pre-allocated FP8 output with shape (M, B*N).
         y_scale (Optional[torch.Tensor]): Pre-allocated FP32 scales with shape (M, 1).
         row_amax (Optional[torch.Tensor]): Zero-initialized FP32 workspace with shape (M,).
-        row_counter (Optional[torch.Tensor]): Zero-initialized int32 workspace with shape (3*M,).
+        row_counter (Optional[torch.Tensor]): Zero-initialized int32 workspace with shape (M,).
 
     Returns:
         torch.Tensor: BF16/FP16 output, or ``(YQ_ptpc, y_scale)`` when
@@ -108,7 +108,6 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
 
     if emit_ptpc:
         assert transpose_bm, "PTPC output requires transpose_bm=True"
-        assert M <= 64, "Fused PTPC output currently supports M <= 64"
         assert YQ.is_contiguous(), "PTPC BF16 scratch must be contiguous (M, B, N)"
         if YQ_ptpc is None:
             YQ_ptpc = torch.empty((M, B * N), dtype=WQ.dtype, device=X.device)
@@ -117,11 +116,11 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         if row_amax is None:
             row_amax = torch.zeros((M,), dtype=torch.float32, device=X.device)
         if row_counter is None:
-            row_counter = torch.zeros((3 * M,), dtype=torch.int32, device=X.device)
+            row_counter = torch.zeros((M,), dtype=torch.int32, device=X.device)
         assert YQ_ptpc.shape == (M, B * N) and YQ_ptpc.is_contiguous()
         assert y_scale.shape == (M, 1) and y_scale.dtype == torch.float32
         assert row_amax.shape == (M,) and row_amax.dtype == torch.float32
-        assert row_counter.shape == (3 * M,) and row_counter.dtype == torch.int32
+        assert row_counter.shape == (M,) and row_counter.dtype == torch.int32
     else:
         # Dead placeholders removed by the EMIT_PTPC constexpr specialization.
         YQ_ptpc = YQ

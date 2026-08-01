@@ -246,13 +246,11 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
             pack=1,
         )
 
-        # PTPC mode is restricted to a residency-safe low-M grid. All programs
-        # can therefore rendezvous without starving unscheduled producers.
-        complete_ptr = row_counter_ptr + pid_m
-        ready_ptr = row_counter_ptr + M + pid_m
-        quant_done_ptr = row_counter_ptr + 2 * M + pid_m
+        # Every program in one M tile covers the same rows, so one scalar
+        # completion counter per pid_m identifies a common finalizer program.
+        # acq_rel makes all prior BF16 stores and amax atomics visible to it.
         finished = tl.atomic_add(
-            complete_ptr,
+            row_counter_ptr + pid_m,
             1,
             sem="acq_rel",
             scope="gpu",
@@ -266,65 +264,34 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
                 row_scale,
                 mask=valid_m,
             )
-            _ = tl.inline_asm_elementwise(
-                asm="s_waitcnt vmcnt(0)\ns_mov_b32 $0, 0",
-                constraints="=s",
-                args=[],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
-            tl.atomic_add(ready_ptr, 1, sem="release", scope="gpu")
-        else:
-            while tl.atomic_add(
-                ready_ptr, 0, sem="acquire", scope="gpu"
-            ) == 0:
-                _ = tl.inline_asm_elementwise(
-                    asm="s_sleep 1\ns_mov_b32 $0, 0",
-                    constraints="=s",
-                    args=[],
-                    dtype=tl.int32,
-                    is_pure=False,
-                    pack=1,
+
+            for q_start in tl.static_range(0, B * N, BLOCK_SIZE_N):
+                offs_qn = q_start + tl.arange(0, BLOCK_SIZE_N)
+                q_mask = valid_m[:, None] & (offs_qn[None, :] < B * N)
+                bf16_row = tl.load(
+                    c_ptr + offs_cm[:, None] * stride_cm + offs_qn[None, :],
+                    mask=q_mask,
+                    other=0.0,
+                    cache_modifier=".cg",
+                )
+                quant_row = tl.clamp(
+                    bf16_row.to(tl.float32) / row_scale[:, None],
+                    DTYPE_MIN,
+                    DTYPE_MAX,
+                ).to(c_ptpc_ptr.dtype.element_ty)
+                tl.store(
+                    c_ptpc_ptr
+                    + offs_cm[:, None] * stride_ptpc_m
+                    + offs_qn[None, :] * stride_ptpc_n,
+                    quant_row,
+                    mask=q_mask,
+                    cache_modifier=".cs",
                 )
 
-        row_scale = tl.load(c_scale_ptr + offs_cm * stride_scale_m, mask=valid_m)
-        flat_n = batch_id * N + offs_cn
-        q_mask = valid_m[:, None] & valid_n[None, :]
-        quant_tile = tl.clamp(
-            c.to(tl.float32) / row_scale[:, None],
-            DTYPE_MIN,
-            DTYPE_MAX,
-        ).to(c_ptpc_ptr.dtype.element_ty)
-        tl.store(
-            c_ptpc_ptr
-            + offs_cm[:, None] * stride_ptpc_m
-            + flat_n[None, :] * stride_ptpc_n,
-            quant_tile,
-            mask=q_mask,
-            cache_modifier=".cs",
-        )
-        _ = tl.inline_asm_elementwise(
-            asm="s_waitcnt vmcnt(0)\ns_mov_b32 $0, 0",
-            constraints="=s",
-            args=[],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-        quant_done = tl.atomic_add(
-            quant_done_ptr,
-            1,
-            sem="acq_rel",
-            scope="gpu",
-        )
-        if quant_done == expected_tiles - 1:
             # The caller initializes these buffers once. Self-reset makes them
             # safe for eager reuse and graph replay without captured memsets.
             tl.store(row_amax_ptr + offs_cm, 0.0, mask=valid_m)
-            tl.store(complete_ptr, 0)
-            tl.store(ready_ptr, 0)
-            tl.store(quant_done_ptr, 0)
+            tl.store(row_counter_ptr + pid_m, 0)
 
 
 def _get_config(

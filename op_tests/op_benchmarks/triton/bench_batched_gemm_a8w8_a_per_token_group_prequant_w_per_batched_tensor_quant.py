@@ -66,7 +66,7 @@ def bench_gemm_fn(
     )
     y_scale = torch.empty((M, 1), dtype=torch.float32, device=x.device)
     row_amax = torch.zeros((M,), dtype=torch.float32, device=x.device)
-    row_counter = torch.zeros((3 * M,), dtype=torch.int32, device=x.device)
+    row_counter = torch.zeros((M,), dtype=torch.int32, device=x.device)
 
     def fn():
         result = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
