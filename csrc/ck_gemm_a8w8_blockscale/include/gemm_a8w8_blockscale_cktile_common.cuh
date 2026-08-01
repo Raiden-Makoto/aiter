@@ -44,8 +44,8 @@ using CLayout         = ck_tile::tensor_layout::gemm::RowMajor;
 
 using CDEElementWise = ck_tile::element_wise::PassThrough;
 
-using DefaultAQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>;
-using DefaultBQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>;
+using AQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 1, 128>>;
+using BQuantGroupSize = ck_tile::QuantGroupShape<ck_tile::sequence<1, 128, 128>>;
 
 template <ck_tile::index_t M_Tile,
           ck_tile::index_t N_Tile,
@@ -118,9 +118,7 @@ template <typename QDataType,
           bool PadN,
           bool PadK,
           bool PreshuffleB,
-          bool UseDoubleSmemBuffer = PreshuffleB,
-          typename AQuantGroupSize = DefaultAQuantGroupSize,
-          typename BQuantGroupSize = DefaultBQuantGroupSize>
+          bool UseDoubleSmemBuffer = PreshuffleB>
 void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 {
 
@@ -250,12 +248,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
     BaseGemmPipeline::TailHandler(Run, has_hot_loop, tail_num);
 }
 
-template <typename QDataType,
-          typename OutDataType,
-          typename GemmConfig,
-          bool PreshuffleB,
-          typename AQuantGroupSize = DefaultAQuantGroupSize,
-          typename BQuantGroupSize = DefaultBQuantGroupSize>
+template <typename QDataType, typename OutDataType, typename GemmConfig, bool PreshuffleB>
 void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 {
     const bool pad_n = (args.N % BQuantGroupSize::kN != 0);
@@ -263,60 +256,23 @@ void TileGemmCompute(ck_tile::QuantGemmHostArgs& args)
 
     if(pad_n && pad_k)
     {
-        TileGemmComputeImpl<QDataType,
-                            OutDataType,
-                            GemmConfig,
-                            true,
-                            true,
-                            PreshuffleB,
-                            PreshuffleB,
-                            AQuantGroupSize,
-                            BQuantGroupSize>(args);
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, true, PreshuffleB>(args);
     }
     else if(pad_n && !pad_k)
     {
-        TileGemmComputeImpl<QDataType,
-                            OutDataType,
-                            GemmConfig,
-                            true,
-                            false,
-                            PreshuffleB,
-                            PreshuffleB,
-                            AQuantGroupSize,
-                            BQuantGroupSize>(args);
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, true, false, PreshuffleB>(args);
     }
     else if(!pad_n && pad_k)
     {
-        TileGemmComputeImpl<QDataType,
-                            OutDataType,
-                            GemmConfig,
-                            false,
-                            true,
-                            PreshuffleB,
-                            PreshuffleB,
-                            AQuantGroupSize,
-                            BQuantGroupSize>(args);
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, true, PreshuffleB>(args);
     }
     else
     {
-        TileGemmComputeImpl<QDataType,
-                            OutDataType,
-                            GemmConfig,
-                            false,
-                            false,
-                            PreshuffleB,
-                            PreshuffleB,
-                            AQuantGroupSize,
-                            BQuantGroupSize>(args);
+        TileGemmComputeImpl<QDataType, OutDataType, GemmConfig, false, false, PreshuffleB>(args);
     }
 }
 
-template <typename QDataType,
-          typename OutDataType,
-          typename GemmInstance,
-          typename AQuantGroupSize = DefaultAQuantGroupSize,
-          typename BQuantGroupSize = DefaultBQuantGroupSize,
-          bool AQInputRowMajor      = false>
+template <typename QDataType, typename OutDataType, typename GemmInstance>
 __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ,
                                                                torch::Tensor& WQ,
                                                                torch::Tensor& x_scale,
@@ -377,11 +333,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     // through the async kernel launch.
     torch::Tensor x_scale_t;
 
-    if constexpr(AQInputRowMajor)
-    {
-        args.aq_ptr = x_scale.data_ptr();
-    }
-    else if constexpr(aq_col_major)
+    if constexpr(aq_col_major)
     {
         // 8-warp ColumnMajor AQ: transpose x_scale to col-major
         if(!PreshuffleB)
@@ -432,9 +384,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int stride_A  = XQ.stride(0);
     const int stride_B  = WQ.stride(0);
     const int stride_C  = Y.stride(0);
-    const int stride_AQ =
-        AQInputRowMajor ? static_cast<int>(x_scale.stride(0))
-                        : (aq_col_major ? M : static_cast<int>(x_scale.stride(0)));
+    const int stride_AQ = aq_col_major ? M : static_cast<int>(x_scale.stride(0));
     const int stride_BQ = w_scale.stride(0);
 
     args.QK_A      = AQK;
@@ -456,21 +406,11 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     // do tile GEMM
     if(PreshuffleB)
     {
-        TileGemmCompute<QDataType,
-                        OutDataType,
-                        GemmInstance,
-                        true,
-                        AQuantGroupSize,
-                        BQuantGroupSize>(args);
+        TileGemmCompute<QDataType, OutDataType, GemmInstance, true>(args);
     }
     else
     {
-        TileGemmCompute<QDataType,
-                        OutDataType,
-                        GemmInstance,
-                        false,
-                        AQuantGroupSize,
-                        BQuantGroupSize>(args);
+        TileGemmCompute<QDataType, OutDataType, GemmInstance, false>(args);
     }
 
     return Y;
