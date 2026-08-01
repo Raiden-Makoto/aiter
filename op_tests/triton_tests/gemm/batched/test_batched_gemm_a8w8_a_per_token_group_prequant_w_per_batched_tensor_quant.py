@@ -187,7 +187,8 @@ def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
 
 @pytest.mark.parametrize("m", [1, 4, 8, 16, 32, 64])
 @pytest.mark.parametrize("batch,n", [(32, 128), (8, 512)])
-def test_batched_gemm_group_quant_output(m, batch, n):
+@pytest.mark.parametrize("transpose_scale", [False, True])
+def test_batched_gemm_group_quant_output(m, batch, n, transpose_scale):
     k = 512
     x, weight, w_scale, _, _ = generate_batched_gemm_a16w8_inputs(
         batch,
@@ -215,7 +216,7 @@ def test_batched_gemm_group_quant_output(m, batch, n):
         bf16.flatten(1),
         quant_dtype=aiter.dtypes.fp8,
         group_size=128,
-        transpose_scale=False,
+        transpose_scale=transpose_scale,
     )
     actual, actual_scale = (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
@@ -225,6 +226,7 @@ def test_batched_gemm_group_quant_output(m, batch, n):
             transpose_bm=True,
             transpose_bm_in=True,
             emit_group_quant=True,
+            transpose_group_scale=transpose_scale,
         )
     )
     torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)

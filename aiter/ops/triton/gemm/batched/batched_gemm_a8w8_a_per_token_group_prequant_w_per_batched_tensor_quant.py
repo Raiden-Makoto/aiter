@@ -24,6 +24,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     config: Optional[dict] = None,
     emit_group_quant: bool = False,
     y_scale: Optional[torch.Tensor] = None,
+    transpose_group_scale: bool = False,
 ):
     """
     Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.
@@ -46,6 +47,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         emit_group_quant (bool): Emit group-128 FP8 output instead of BF16.
         y_scale (Optional[torch.Tensor]): Pre-allocated FP32 output scales
             (M, B * N/128).
+        transpose_group_scale (bool): Store group scales in column-major layout.
 
     Returns:
         torch.Tensor: Output batch, or ``(YQ.view(M, B*N), y_scale)`` when
@@ -82,9 +84,15 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         if YQ is None:
             YQ = torch.empty((M, B, N), dtype=WQ.dtype, device=X.device)
         if y_scale is None:
-            y_scale = torch.empty(
-                (M, B * (N // 128)), dtype=torch.float32, device=X.device
-            )
+            scale_groups = B * (N // 128)
+            if transpose_group_scale:
+                y_scale = torch.empty(
+                    (scale_groups, M), dtype=torch.float32, device=X.device
+                ).T
+            else:
+                y_scale = torch.empty(
+                    (M, scale_groups), dtype=torch.float32, device=X.device
+                )
         assert YQ.shape == (M, B, N) and YQ.dtype == WQ.dtype
         assert y_scale.shape == (
             M,
