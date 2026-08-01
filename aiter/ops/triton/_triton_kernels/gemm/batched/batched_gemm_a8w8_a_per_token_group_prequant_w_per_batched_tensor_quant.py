@@ -17,6 +17,7 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
         "GROUP_SIZE_M",
         "EVEN_K",
         "EVEN_MN",
+        "EMIT_GROUP_QUANT",
         "cache_modifier",
     ],
 )
@@ -38,6 +39,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     a_ptr,
     b_ptr,
     c_ptr,
+    c_scale_ptr,
     b_scale_ptr,
     bias_ptr,
     # Matrix dimensions
@@ -57,6 +59,8 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     stride_in_cb,
     stride_in_cm,
     stride_in_cn,
+    stride_scale_m,
+    stride_scale_b,
     stride_in_biasb,
     # Meta-parameters
     HAS_BIAS: tl.constexpr,
@@ -68,6 +72,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     EVEN_MN: tl.constexpr,
+    EMIT_GROUP_QUANT: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
     """
@@ -190,8 +195,6 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         bias = tl.load(bias_ptr + batch_id * stride_biasb + offs_bias)
         accumulator = accumulator.to(bias_ptr.type.element_ty) + bias[None, :]
 
-    c = accumulator.to(c_ptr.type.element_ty)
-
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = (
@@ -200,11 +203,36 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         + stride_cm * offs_cm[:, None]
         + stride_cn * offs_cn[None, :]
     )
-    if EVEN_MN:
-        tl.store(c_ptrs, c)
+    if EMIT_GROUP_QUANT:
+        c_bf16 = accumulator.to(tl.bfloat16)
+        valid_n = offs_cn < N
+        amax = tl.max(
+            tl.where(valid_n[None, :], tl.abs(c_bf16.to(tl.float32)), 0.0),
+            axis=1,
+        )
+        out_scale = tl.maximum(amax, 1.0e-10) / DTYPE_MAX
+        quant = tl.clamp(
+            c_bf16.to(tl.float32) / out_scale[:, None],
+            DTYPE_MIN,
+            DTYPE_MAX,
+        ).to(c_ptr.dtype.element_ty)
+        valid_m = offs_cm < M
+        mask = valid_m[:, None] & valid_n[None, :]
+        tl.store(c_ptrs, quant, mask=mask)
+        tl.store(
+            c_scale_ptr
+            + offs_cm * stride_scale_m
+            + batch_id * stride_scale_b,
+            out_scale,
+            mask=valid_m,
+        )
     else:
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, c, mask=c_mask)
+        c = accumulator.to(c_ptr.type.element_ty)
+        if EVEN_MN:
+            tl.store(c_ptrs, c)
+        else:
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tl.store(c_ptrs, c, mask=c_mask)
 
 
 def _get_config(
