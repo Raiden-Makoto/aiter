@@ -44,7 +44,8 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         transpose_bm_in (Optional[bool]): Transpose batch and M dimensions in input.
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M).
         emit_group_quant (bool): Emit group-128 FP8 output instead of BF16.
-        y_scale (Optional[torch.Tensor]): Pre-allocated FP32 output scales (M, B).
+        y_scale (Optional[torch.Tensor]): Pre-allocated FP32 output scales
+            (M, B * N/128).
 
     Returns:
         torch.Tensor: Output batch, or ``(YQ.view(M, B*N), y_scale)`` when
@@ -77,13 +78,18 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     has_bias = bias is not None
     if emit_group_quant:
         assert transpose_bm, "group-quant output requires transpose_bm=True"
-        assert N == 128, "group-quant output requires N=128"
+        assert N % 128 == 0, "group-quant output requires N divisible by 128"
         if YQ is None:
             YQ = torch.empty((M, B, N), dtype=WQ.dtype, device=X.device)
         if y_scale is None:
-            y_scale = torch.empty((M, B), dtype=torch.float32, device=X.device)
+            y_scale = torch.empty(
+                (M, B * (N // 128)), dtype=torch.float32, device=X.device
+            )
         assert YQ.shape == (M, B, N) and YQ.dtype == WQ.dtype
-        assert y_scale.shape == (M, B) and y_scale.dtype == torch.float32
+        assert y_scale.shape == (
+            M,
+            B * (N // 128),
+        ) and y_scale.dtype == torch.float32
     elif YQ is None:
         if transpose_bm:
             YQ = torch.empty((M, B, N), dtype=dtype, device=X.device)

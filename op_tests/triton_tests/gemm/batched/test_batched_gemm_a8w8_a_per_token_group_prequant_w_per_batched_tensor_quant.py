@@ -186,8 +186,9 @@ def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
 
 
 @pytest.mark.parametrize("m", [1, 4, 8, 16, 32, 64])
-def test_batched_gemm_group_quant_output(m):
-    batch, n, k = 32, 128, 512
+@pytest.mark.parametrize("batch,n", [(32, 128), (8, 512)])
+def test_batched_gemm_group_quant_output(m, batch, n):
+    k = 512
     x, weight, w_scale, _, _ = generate_batched_gemm_a16w8_inputs(
         batch,
         m,
