@@ -6,12 +6,15 @@ import torch
 import torch.nn.functional as F
 
 import aiter
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mixedscale_bpreshuffle
+from aiter.ops.gemm_op_a8w8 import (
+    gemm_a8w8_blockscale_bpreshuffle_ck,
+    gemm_a8w8_mixedscale_bpreshuffle,
+)
 from aiter.ops.quant import per_group_quant_hip
 from aiter.ops.shuffle import shuffle_weight
 
 
-@pytest.mark.parametrize("m", [1, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize("m", [1, 4, 16, 64, 256, 512, 1024])
 def test_gemm_a8w8_mixedscale_xdl(m):
     n, k = 6144, 4096
     torch.manual_seed(2026 + m)
@@ -54,6 +57,36 @@ def test_gemm_a8w8_mixedscale_xdl(m):
     torch.testing.assert_close(actual, expected, rtol=0.1, atol=0.1)
 
 
+@pytest.mark.parametrize("m", [1, 16, 512])
+def test_gemm_a8w8_mixedscale_channel_ones_matches_blockscale(m):
+    n, k = 6144, 4096
+    torch.manual_seed(3026 + m)
+    x_q = (torch.randn((m, k), dtype=torch.float32, device="cuda") / 10).to(
+        aiter.dtypes.fp8
+    )
+    weight_q = (
+        torch.randn((n, k), dtype=torch.float32, device="cuda") / 10
+    ).to(aiter.dtypes.fp8)
+    weight_q = shuffle_weight(weight_q, (16, 16)).contiguous()
+    x_scale = torch.rand(
+        (m, k // 128), dtype=torch.float32, device="cuda"
+    ).T.contiguous().view(m, k // 128)
+    b_block_scale = torch.rand(
+        (n // 128, k // 128), dtype=torch.float32, device="cuda"
+    )
+    channel_scale = torch.ones((n, 1), dtype=torch.float32, device="cuda")
+    expected = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    actual = torch.empty_like(expected)
+
+    gemm_a8w8_blockscale_bpreshuffle_ck(
+        x_q, weight_q, x_scale, b_block_scale, expected
+    )
+    gemm_a8w8_mixedscale_bpreshuffle(
+        x_q, weight_q, x_scale, b_block_scale, channel_scale, actual
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_gemm_a8w8_mixedscale_xdl_cuda_graph():
     m, n, k = 4, 6144, 4096
     x = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
@@ -84,6 +117,38 @@ def test_gemm_a8w8_mixedscale_xdl_cuda_graph():
     with torch.cuda.graph(graph):
         gemm_a8w8_mixedscale_bpreshuffle(
             x_q, w_q, x_scale, b_block_scale, w_scale, out
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+
+
+def test_gemm_a8w8_blockscale_xdl_cuda_graph_regression():
+    m, n, k = 16, 6144, 4096
+    x_q = (torch.randn((m, k), dtype=torch.float32, device="cuda") / 10).to(
+        aiter.dtypes.fp8
+    )
+    weight_q = (
+        torch.randn((n, k), dtype=torch.float32, device="cuda") / 10
+    ).to(aiter.dtypes.fp8)
+    weight_q = shuffle_weight(weight_q, (16, 16)).contiguous()
+    x_scale = torch.rand(
+        (m, k // 128), dtype=torch.float32, device="cuda"
+    ).T.contiguous().view(m, k // 128)
+    weight_scale = torch.rand(
+        (n // 128, k // 128), dtype=torch.float32, device="cuda"
+    )
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+
+    for _ in range(3):
+        gemm_a8w8_blockscale_bpreshuffle_ck(
+            x_q, weight_q, x_scale, weight_scale, out
+        )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gemm_a8w8_blockscale_bpreshuffle_ck(
+            x_q, weight_q, x_scale, weight_scale, out
         )
     graph.replay()
     torch.cuda.synchronize()
