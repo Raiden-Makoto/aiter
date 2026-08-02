@@ -67,14 +67,7 @@ using CDEElementOp = PassThrough;
 using MixedDsDataType = ck::Tuple<F32>;
 using MixedDsLayout   = ck::Tuple<Row>;
 
-struct MultiplyChannelScale
-{
-    template <typename E, typename C, typename D>
-    __host__ __device__ constexpr void operator()(E& e, const C& c, const D& d) const
-    {
-        e = ck::type_convert<E>(ck::type_convert<float>(c) * ck::type_convert<float>(d));
-    }
-};
+using MultiplyChannelScale = ck::MultiplyPerChannel;
 
 template <typename AB1DataType,
           typename EDataType,
