@@ -10,7 +10,7 @@ from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import (
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import (
     _get_config,
 )
-from aiter.ops.triton.quant.fused_mxfp4_quant import fused_flatten_mxfp4_quant
+from aiter.ops.triton.quant.fused_mxfp4_quant import batched_mxfp4_quant
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
@@ -79,11 +79,7 @@ def bench_gemm_fn(
     x_bf16 = torch.randn((batch, M, K), dtype=torch.bfloat16, device="cuda")
 
     def quantize():
-        packed, scales = fused_flatten_mxfp4_quant(x_bf16)
-        return (
-            packed.view(batch, M, K // 2),
-            scales.view(batch, M, K // 32),
-        )
+        return batched_mxfp4_quant(x_bf16)
 
     def gemm():
         return batched_gemm_afp4wfp4(

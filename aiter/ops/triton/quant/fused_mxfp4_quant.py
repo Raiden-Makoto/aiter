@@ -8,6 +8,7 @@ from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
 )
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
+    _batched_mxfp4_quant,
     _fused_dynamic_mxfp4_quant_moe_sort_kernel,
     _fused_flatten_mxfp4_quant,
     _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
@@ -190,6 +191,36 @@ def fused_flatten_mxfp4_quant(
     )
 
     return out, out_block_scales
+
+
+def batched_mxfp4_quant(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize each row of a contiguous batched BF16/FP16 tensor to MXFP4."""
+    if x.ndim != 3:
+        raise ValueError(f"expected a (B, M, K) tensor, got shape {tuple(x.shape)}")
+
+    batch, rows, K = x.shape
+    if K % 32 != 0:
+        raise ValueError(f"K must be divisible by 32, got {K}")
+
+    out = torch.empty((batch, rows, K // 2), dtype=torch.uint8, device=x.device)
+    scales = torch.empty(
+        (batch, rows, K // 32), dtype=torch.uint8, device=x.device
+    )
+    block_size_k = max(triton.next_power_of_2(K), 32)
+    _batched_mxfp4_quant[(batch, rows)](
+        x,
+        out,
+        scales,
+        *x.stride(),
+        *out.stride(),
+        *scales.stride(),
+        K,
+        BLOCK_SIZE_K=block_size_k,
+        MXFP4_QUANT_BLOCK_SIZE=32,
+    )
+    return out, scales
 
 
 def fused_reduce_act_mul_and_mxfp4_quant(

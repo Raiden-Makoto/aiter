@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from aiter.ops.quant import per_1x32_f4_quant_hip
 from aiter.ops.triton.quant.fused_mxfp4_quant import (
+    batched_mxfp4_quant,
     fused_dynamic_mxfp4_quant_moe_sort,
     fused_flatten_mxfp4_quant,
     fused_reduce_act_mul_and_mxfp4_quant,
@@ -139,6 +140,25 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
 
     torch.testing.assert_close(triton_scale, torch_scale)
     torch.testing.assert_close(triton_out, torch_out)
+
+
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("M", [1, 33])
+@pytest.mark.parametrize("K", [192, 512])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_batched_quant(B: int, M: int, K: int, dtype):
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.manual_seed(0)
+    x = torch.randn((B, M, K), dtype=dtype, device="cuda")
+    expected, expected_scales = torch_dynamic_mxfp4_quant(x.view(B * M, K))
+    actual, actual_scales = batched_mxfp4_quant(x)
+
+    torch.testing.assert_close(actual.view(B * M, K // 2), expected)
+    torch.testing.assert_close(
+        actual_scales.view(B * M, K // 32), expected_scales
+    )
 
 
 @pytest.mark.parametrize(
