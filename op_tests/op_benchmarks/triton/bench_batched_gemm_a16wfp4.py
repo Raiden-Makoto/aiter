@@ -7,6 +7,9 @@ import triton
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
+from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
+    _get_config,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
@@ -32,6 +35,9 @@ def bench_gemm_fn(
     K: int,
     metric: str,
     layout: str,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int | None = None,
 ):
     c_dtype = torch.bfloat16
     x, w, _x_scale, w_scale, y = generate_batched_gemm_a16wfp4_inputs(
@@ -48,8 +54,20 @@ def bench_gemm_fn(
     mem_write = y.numel() * y.element_size()
     mem = mem_read + mem_write
 
+    config = None
+    if any(value is not None for value in (block_m, block_n, block_k)):
+        config, _ = _get_config(M, N, K)
+        config = config.copy()
+        config["NUM_KSPLIT"] = 1
+        if block_m is not None:
+            config["BLOCK_SIZE_M"] = block_m
+        if block_n is not None:
+            config["BLOCK_SIZE_N"] = block_n
+        if block_k is not None:
+            config["BLOCK_SIZE_K"] = block_k
+
     ms = triton.testing.do_bench(
-        lambda: batched_gemm_a16wfp4(x, w, w_scale, c_dtype, y),
+        lambda: batched_gemm_a16wfp4(x, w, w_scale, c_dtype, y, config=config),
         warmup=25,
         rep=100,
     )
@@ -92,7 +110,17 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            args.block_m,
+            args.block_n,
+            args.block_k,
+        )
 
     bench_batched_gemm_a16wfp4.run(save_path="." if args.o else None, print_data=True)
 
@@ -113,7 +141,17 @@ def run_shape_benchmark(args):
         metric,
         **kwargs,
     ):
-        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            args.layout,
+            args.block_m,
+            args.block_n,
+            args.block_k,
+        )
 
     bench_batched_gemm_a16wfp4.run(save_path="." if args.o else None, print_data=True)
 
@@ -155,6 +193,9 @@ def parse_args(args: list[str] | None = None):
         required=False,
         help="Batch size to be used when using --model flag.",
     )
+    parser.add_argument("--block-m", type=int)
+    parser.add_argument("--block-n", type=int)
+    parser.add_argument("--block-k", type=int)
     return get_ff_args(parser, args=args)
 
 

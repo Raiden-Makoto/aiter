@@ -7,6 +7,10 @@ import triton
 from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import (
     batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,  # noqa: PLC0414  explicit re-export (PEP 484 redundant-alias form)
 )
+from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import (
+    _get_config,
+)
+from aiter.ops.triton.quant.fused_mxfp4_quant import fused_flatten_mxfp4_quant
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
@@ -26,7 +30,17 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
 
 
 def bench_gemm_fn(
-    batch: int, M: int, N: int, K: int, metric: str, layout: str, model_name=None
+    batch: int,
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    model_name=None,
+    mode: str = "gemm",
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int | None = None,
 ):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_inputs(
@@ -50,11 +64,40 @@ def bench_gemm_fn(
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: batched_gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
-        warmup=25,
-        rep=100,
-    )
+    config = None
+    if any(value is not None for value in (block_m, block_n, block_k)):
+        config, _ = _get_config(M, N, K // 2)
+        config = config.copy()
+        config["NUM_KSPLIT"] = 1
+        if block_m is not None:
+            config["BLOCK_SIZE_M"] = block_m
+        if block_n is not None:
+            config["BLOCK_SIZE_N"] = block_n
+        if block_k is not None:
+            config["BLOCK_SIZE_K"] = block_k
+
+    x_bf16 = torch.randn((batch, M, K), dtype=torch.bfloat16, device="cuda")
+
+    def quantize():
+        packed, scales = fused_flatten_mxfp4_quant(x_bf16)
+        return (
+            packed.view(batch, M, K // 2),
+            scales.view(batch, M, K // 32),
+        )
+
+    def gemm():
+        return batched_gemm_afp4wfp4(
+            x, w, x_scale, w_scale, c_dtype, y, config=config
+        )
+
+    def quant_gemm():
+        packed, scales = quantize()
+        return batched_gemm_afp4wfp4(
+            packed, w, scales, w_scale, c_dtype, y, config=config
+        )
+
+    fn = {"gemm": gemm, "quant": quantize, "quant-gemm": quant_gemm}[mode]
+    ms = triton.testing.do_bench(fn, warmup=25, rep=100)
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -94,7 +137,18 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
+        return bench_gemm_fn(
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            layout=args.layout,
+            mode=args.mode,
+            block_m=args.block_m,
+            block_n=args.block_n,
+            block_k=args.block_k,
+        )
 
     bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
@@ -108,7 +162,18 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
+        return bench_gemm_fn(
+            batch,
+            M,
+            N,
+            K,
+            metric,
+            layout=args.layout,
+            mode=args.mode,
+            block_m=args.block_m,
+            block_n=args.block_n,
+            block_k=args.block_k,
+        )
 
     bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
@@ -150,6 +215,10 @@ def parse_args(args: list[str] | None = None):
         required=False,
         help="Batch size to be used when using --model flag.",
     )
+    parser.add_argument("--mode", choices=["gemm", "quant", "quant-gemm"], default="gemm")
+    parser.add_argument("--block-m", type=int)
+    parser.add_argument("--block-n", type=int)
+    parser.add_argument("--block-k", type=int)
     return get_ff_args(parser, args=args)
 
 
