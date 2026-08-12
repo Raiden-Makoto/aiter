@@ -228,6 +228,148 @@ def _batched_gemm_a16wfp4_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+@triton.jit
+def _batched_gemm_a16wfp4_persistent_n_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scales_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bn,
+    stride_bk,
+    stride_cb,
+    stride_cm,
+    stride_cn,
+    stride_bsb,
+    stride_bsn,
+    stride_bsk,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    """K-up kernel: quantize A once while accumulating two adjacent N tiles."""
+    pid_batch = tl.program_id(0).to(tl.int64)
+    pid_m = tl.program_id(1)
+
+    m_offsets = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    k_offsets_bf16 = tl.arange(0, BLOCK_SIZE_K)
+    k_offsets_fp4 = tl.arange(0, BLOCK_SIZE_K // 2)
+    scale_offsets = tl.arange(0, BLOCK_SIZE_K // 32)
+    n0_offsets = tl.arange(0, BLOCK_SIZE_N)
+    n1_offsets = BLOCK_SIZE_N + n0_offsets
+
+    a_ptrs = (
+        a_ptr
+        + pid_batch * stride_ab
+        + m_offsets[:, None] * stride_am
+        + k_offsets_bf16[None, :] * stride_ak
+    )
+    b0_ptrs = (
+        b_ptr
+        + pid_batch * stride_bb
+        + n0_offsets[:, None] * stride_bn
+        + k_offsets_fp4[None, :] * stride_bk
+    )
+    b1_ptrs = (
+        b_ptr
+        + pid_batch * stride_bb
+        + n1_offsets[:, None] * stride_bn
+        + k_offsets_fp4[None, :] * stride_bk
+    )
+    bs0_ptrs = (
+        b_scales_ptr
+        + pid_batch * stride_bsb
+        + n0_offsets[:, None] * stride_bsn
+        + scale_offsets[None, :] * stride_bsk
+    )
+    bs1_ptrs = (
+        b_scales_ptr
+        + pid_batch * stride_bsb
+        + n1_offsets[:, None] * stride_bsn
+        + scale_offsets[None, :] * stride_bsk
+    )
+
+    acc0 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_SIZE_K):
+        a_bf16 = tl.load(
+            a_ptrs,
+            mask=(m_offsets < M)[:, None]
+            & (k_start + k_offsets_bf16 < K)[None, :],
+            other=0.0,
+        )
+        a, a_scales = _mxfp4_quant_op(
+            a_bf16, BLOCK_SIZE_K, BLOCK_SIZE_M, 32
+        )
+        b0 = tl.load(
+            b0_ptrs,
+            mask=(n0_offsets < N)[:, None]
+            & (k_start // 2 + k_offsets_fp4 < K // 2)[None, :],
+            other=0,
+        )
+        b1 = tl.load(
+            b1_ptrs,
+            mask=(n1_offsets < N)[:, None]
+            & (k_start // 2 + k_offsets_fp4 < K // 2)[None, :],
+            other=0,
+        )
+        bs0 = tl.load(
+            bs0_ptrs,
+            mask=(n0_offsets < N)[:, None]
+            & (k_start // 32 + scale_offsets < K // 32)[None, :],
+            other=127,
+        )
+        bs1 = tl.load(
+            bs1_ptrs,
+            mask=(n1_offsets < N)[:, None]
+            & (k_start // 32 + scale_offsets < K // 32)[None, :],
+            other=127,
+        )
+
+        acc0 = tl.dot_scaled(
+            a, a_scales, "e2m1", b0, bs0, "e2m1", acc=acc0
+        )
+        acc1 = tl.dot_scaled(
+            a, a_scales, "e2m1", b1, bs1, "e2m1", acc=acc1
+        )
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b0_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+        b1_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+        bs0_ptrs += (BLOCK_SIZE_K // 32) * stride_bsk
+        bs1_ptrs += (BLOCK_SIZE_K // 32) * stride_bsk
+
+    c0_ptrs = (
+        c_ptr
+        + pid_batch * stride_cb
+        + m_offsets[:, None] * stride_cm
+        + n0_offsets[None, :] * stride_cn
+    )
+    c1_ptrs = (
+        c_ptr
+        + pid_batch * stride_cb
+        + m_offsets[:, None] * stride_cm
+        + n1_offsets[None, :] * stride_cn
+    )
+    tl.store(
+        c0_ptrs,
+        acc0.to(c_ptr.type.element_ty),
+        mask=(m_offsets < M)[:, None] & (n0_offsets < N)[None, :],
+    )
+    tl.store(
+        c1_ptrs,
+        acc1.to(c_ptr.type.element_ty),
+        mask=(m_offsets < M)[:, None] & (n1_offsets < N)[None, :],
+    )
+
+
 @triton.jit(repr=_batched_gemm_a16wfp4_reduce_repr)
 def _batched_gemm_a16wfp4_reduce_kernel(
     c_in_ptr,

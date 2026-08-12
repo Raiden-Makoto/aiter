@@ -3,6 +3,7 @@ import torch
 
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
+    batched_gemm_a16wfp4_persistent_n,
 )
 from aiter.ops.triton.utils._triton import arch_info
 
@@ -190,6 +191,23 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     batched_gemm_a16wfp4(x, w, w_scales, dtype, out, transpose_bm=False, prequant=True)
 
     torch.testing.assert_close(torch_out, out)
+
+
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("M", [1, 33, 512])
+@pytest.mark.parametrize("block_size_m", [32, 64])
+def test_batched_gemm_a16wfp4_persistent_n(B: int, M: int, block_size_m: int):
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    x, w, _x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
+        B, M, 512, 192, torch.bfloat16, layout="TN", output=True
+    )
+    expected = run_torch(x, w, w_scales, torch.bfloat16)
+    batched_gemm_a16wfp4_persistent_n(
+        x, w, w_scales, out, block_size_m=block_size_m
+    )
+    torch.testing.assert_close(expected, out)
 
 
 def test_batched_gemm_a16wfp4_fake_honors_transpose_bm():
