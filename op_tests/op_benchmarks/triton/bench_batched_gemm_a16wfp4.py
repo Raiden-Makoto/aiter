@@ -6,7 +6,6 @@ import triton
 
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
-    batched_gemm_a16wfp4_persistent_n,
 )
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
     _get_config,
@@ -39,7 +38,6 @@ def bench_gemm_fn(
     block_m: int | None = None,
     block_n: int | None = None,
     block_k: int | None = None,
-    persistent_n: bool = False,
 ):
     c_dtype = torch.bfloat16
     x, w, _x_scale, w_scale, y = generate_batched_gemm_a16wfp4_inputs(
@@ -68,16 +66,11 @@ def bench_gemm_fn(
         if block_k is not None:
             config["BLOCK_SIZE_K"] = block_k
 
-    if persistent_n:
-        fn = lambda: batched_gemm_a16wfp4_persistent_n(
-            x, w, w_scale, y, block_size_m=block_m or 64
-        )
-    else:
-        fn = lambda: batched_gemm_a16wfp4(
-            x, w, w_scale, c_dtype, y, config=config
-        )
-
-    ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+    ms = triton.testing.do_bench(
+        lambda: batched_gemm_a16wfp4(x, w, w_scale, c_dtype, y, config=config),
+        warmup=25,
+        rep=100,
+    )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -127,7 +120,6 @@ def run_model_benchmark(args):
             args.block_m,
             args.block_n,
             args.block_k,
-            args.persistent_n,
         )
 
     bench_batched_gemm_a16wfp4.run(save_path="." if args.o else None, print_data=True)
@@ -159,7 +151,6 @@ def run_shape_benchmark(args):
             args.block_m,
             args.block_n,
             args.block_k,
-            args.persistent_n,
         )
 
     bench_batched_gemm_a16wfp4.run(save_path="." if args.o else None, print_data=True)
@@ -205,7 +196,6 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument("--block-m", type=int)
     parser.add_argument("--block-n", type=int)
     parser.add_argument("--block-k", type=int)
-    parser.add_argument("--persistent-n", action="store_true")
     return get_ff_args(parser, args=args)
 
 

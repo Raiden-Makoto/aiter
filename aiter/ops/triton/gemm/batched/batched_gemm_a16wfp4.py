@@ -7,7 +7,6 @@ import triton
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
     _batched_gemm_a16wfp4_kernel,
-    _batched_gemm_a16wfp4_persistent_n_kernel,
     _batched_gemm_a16wfp4_reduce_kernel,
     _get_config,
 )
@@ -253,46 +252,3 @@ def batched_gemm_a16wfp4(
     return batched_gemm_a16wfp4_(
         x, w, w_scales, dtype, y, config_hashable, transpose_bm, prequant, y_scale
     )
-
-
-def batched_gemm_a16wfp4_persistent_n(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    w_scales: torch.Tensor,
-    y: torch.Tensor | None = None,
-    block_size_m: int = 64,
-) -> torch.Tensor:
-    """Specialized GLM K-up kernel for (B, M, 192) @ (B, 512, 192)."""
-    batch, M, K = x.shape
-    weight_batch, N, packed_k = w.shape
-    if batch != weight_batch or K != 192 or N != 512 or packed_k != K // 2:
-        raise ValueError(
-            "persistent-N A16WFP4 expects x=(B,M,192), w=(B,512,96); "
-            f"got x={tuple(x.shape)}, w={tuple(w.shape)}"
-        )
-    if y is None:
-        y = torch.empty((batch, M, N), dtype=torch.bfloat16, device=x.device)
-
-    _batched_gemm_a16wfp4_persistent_n_kernel[
-        (batch, triton.cdiv(M, block_size_m))
-    ](
-        x,
-        w,
-        y,
-        w_scales,
-        M,
-        N,
-        K,
-        *x.stride(),
-        *w.stride(),
-        *y.stride(),
-        *w_scales.stride(),
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=256,
-        BLOCK_SIZE_K=64,
-        num_warps=8,
-        num_stages=1,
-        waves_per_eu=2,
-        matrix_instr_nonkdim=16,
-    )
-    return y
