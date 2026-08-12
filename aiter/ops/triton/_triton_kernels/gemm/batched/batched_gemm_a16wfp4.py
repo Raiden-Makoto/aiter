@@ -273,14 +273,14 @@ def _batched_gemm_a16wfp4_persistent_n_kernel(
     b0_ptrs = (
         b_ptr
         + pid_batch * stride_bb
-        + k_offsets_fp4[:, None] * stride_bk
-        + n0_offsets[None, :] * stride_bn
+        + n0_offsets[:, None] * stride_bn
+        + k_offsets_fp4[None, :] * stride_bk
     )
     b1_ptrs = (
         b_ptr
         + pid_batch * stride_bb
-        + k_offsets_fp4[:, None] * stride_bk
-        + n1_offsets[None, :] * stride_bn
+        + n1_offsets[:, None] * stride_bn
+        + k_offsets_fp4[None, :] * stride_bk
     )
     bs0_ptrs = (
         b_scales_ptr
@@ -310,14 +310,14 @@ def _batched_gemm_a16wfp4_persistent_n_kernel(
         )
         b0 = tl.load(
             b0_ptrs,
-            mask=(k_start // 2 + k_offsets_fp4 < K // 2)[:, None]
-            & (n0_offsets < N)[None, :],
+            mask=(n0_offsets < N)[:, None]
+            & (k_start // 2 + k_offsets_fp4 < K // 2)[None, :],
             other=0,
         )
         b1 = tl.load(
             b1_ptrs,
-            mask=(k_start // 2 + k_offsets_fp4 < K // 2)[:, None]
-            & (n1_offsets < N)[None, :],
+            mask=(n1_offsets < N)[:, None]
+            & (k_start // 2 + k_offsets_fp4 < K // 2)[None, :],
             other=0,
         )
         bs0 = tl.load(
