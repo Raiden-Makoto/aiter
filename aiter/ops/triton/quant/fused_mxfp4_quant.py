@@ -195,6 +195,7 @@ def fused_flatten_mxfp4_quant(
 
 def batched_mxfp4_quant(
     x: torch.Tensor,
+    block_size_m: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize each row of a contiguous batched BF16/FP16 tensor to MXFP4."""
     if x.ndim != 3:
@@ -209,14 +210,16 @@ def batched_mxfp4_quant(
         (batch, rows, K // 32), dtype=torch.uint8, device=x.device
     )
     block_size_k = max(triton.next_power_of_2(K), 32)
-    _batched_mxfp4_quant[(batch, rows)](
+    _batched_mxfp4_quant[(batch, triton.cdiv(rows, block_size_m))](
         x,
         out,
         scales,
         *x.stride(),
         *out.stride(),
         *scales.stride(),
+        rows,
         K,
+        BLOCK_SIZE_M=block_size_m,
         BLOCK_SIZE_K=block_size_k,
         MXFP4_QUANT_BLOCK_SIZE=32,
     )

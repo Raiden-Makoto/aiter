@@ -41,6 +41,7 @@ def bench_gemm_fn(
     block_m: int | None = None,
     block_n: int | None = None,
     block_k: int | None = None,
+    quant_block_m: int = 32,
 ):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_inputs(
@@ -79,7 +80,7 @@ def bench_gemm_fn(
     x_bf16 = torch.randn((batch, M, K), dtype=torch.bfloat16, device="cuda")
 
     def quantize():
-        return batched_mxfp4_quant(x_bf16)
+        return batched_mxfp4_quant(x_bf16, block_size_m=quant_block_m)
 
     def gemm():
         return batched_gemm_afp4wfp4(
@@ -144,6 +145,7 @@ def run_model_benchmark(args):
             block_m=args.block_m,
             block_n=args.block_n,
             block_k=args.block_k,
+            quant_block_m=args.quant_block_m,
         )
 
     bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
@@ -169,6 +171,7 @@ def run_shape_benchmark(args):
             block_m=args.block_m,
             block_n=args.block_n,
             block_k=args.block_k,
+            quant_block_m=args.quant_block_m,
         )
 
     bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
@@ -215,6 +218,7 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument("--block-m", type=int)
     parser.add_argument("--block-n", type=int)
     parser.add_argument("--block-k", type=int)
+    parser.add_argument("--quant-block-m", type=int, default=32)
     return get_ff_args(parser, args=args)
 
 

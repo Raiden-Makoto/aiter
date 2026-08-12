@@ -282,47 +282,48 @@ def _batched_mxfp4_quant(
     out_scales_stride_b,
     out_scales_stride_m,
     out_scales_stride_k,
+    M,
     K,
+    BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
 ):
     batch = tl.program_id(0)
-    row = tl.program_id(1)
+    row_offsets = tl.program_id(1) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
 
     k_offsets = tl.arange(0, BLOCK_SIZE_K)
     x = tl.load(
         x_ptr
         + batch * x_stride_b
-        + row * x_stride_m
-        + k_offsets * x_stride_k,
-        mask=k_offsets < K,
+        + row_offsets[:, None] * x_stride_m
+        + k_offsets[None, :] * x_stride_k,
+        mask=(row_offsets < M)[:, None] & (k_offsets < K)[None, :],
         other=0.0,
     )
 
     packed, scales = _mxfp4_quant_op(
-        x, BLOCK_SIZE_K, 1, MXFP4_QUANT_BLOCK_SIZE
+        x, BLOCK_SIZE_K, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
     )
-    packed = tl.ravel(packed)
-    scales = tl.ravel(scales)
 
     packed_offsets = tl.arange(0, BLOCK_SIZE_K // 2)
     tl.store(
         out_ptr
         + batch * out_stride_b
-        + row * out_stride_m
-        + packed_offsets * out_stride_k,
+        + row_offsets[:, None] * out_stride_m
+        + packed_offsets[None, :] * out_stride_k,
         packed,
-        mask=packed_offsets < K // 2,
+        mask=(row_offsets < M)[:, None] & (packed_offsets < K // 2)[None, :],
     )
 
     scale_offsets = tl.arange(0, BLOCK_SIZE_K // MXFP4_QUANT_BLOCK_SIZE)
     tl.store(
         out_scales_ptr
         + batch * out_scales_stride_b
-        + row * out_scales_stride_m
-        + scale_offsets * out_scales_stride_k,
+        + row_offsets[:, None] * out_scales_stride_m
+        + scale_offsets[None, :] * out_scales_stride_k,
         scales,
-        mask=scale_offsets < K // MXFP4_QUANT_BLOCK_SIZE,
+        mask=(row_offsets < M)[:, None]
+        & (scale_offsets < K // MXFP4_QUANT_BLOCK_SIZE)[None, :],
     )
 
 
