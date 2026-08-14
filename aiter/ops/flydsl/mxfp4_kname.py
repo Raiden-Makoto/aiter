@@ -10,7 +10,11 @@
 
 import re
 
-_MXMOE_NUMERIC_TOKENS = {"SK": "kSplitK", "XCD": "xcd_swizzle"}
+_MXMOE_NUMERIC_TOKENS = {
+    "SK": "kSplitK",
+    "XCD": "xcd_swizzle",
+    "GN": "group_n",
+}
 _MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN"}
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
@@ -47,6 +51,8 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
 def _parse_mxfp4_g1_kname(kname: str) -> dict:
     parsed = _tokenize_mxfp4_kname(kname, 1, _MXMOE_G1_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
+    if "group_n" in nums:
+        raise ValueError(f"illegal mxmoe g1 name {kname!r}: GN is a g2-only token")
     return {
         "BM": nums["BM"],
         "splitk": "kSplitK" in nums,
@@ -77,6 +83,7 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
         "use_nt": "NT" in flags,
         "mxfp4out": mxfp4out,
         "cshuffle": cshuffle,
+        "group_n": nums.get("group_n", 1),
         "xcd_swizzle": nums.get("xcd_swizzle", 0),
     }
 

@@ -1010,3 +1010,32 @@ def _fused_dynamic_mxfp4_quant_moe_sort_kernel(
         out,
         # mask=blockscale_e8m0_sorted_mask,
     )
+
+
+@triton.jit
+def _mixed_ck_gemm1_to_flydsl_gemm2_payload_kernel(
+    route_order_ptr,
+    sorted_ids_ptr,
+    sorted_payload_ptr,
+    payload_cols: tl.constexpr,
+    token_num: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    sorted_row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    sorted_id = tl.load(sorted_ids_ptr + sorted_row)
+    token_id = sorted_id & 0xFFFFFF
+    route_slot = sorted_id >> 24
+    valid_row = (token_id < token_num) & (route_slot < topk)
+    source_row = token_id * topk + route_slot
+    payload = tl.load(
+        route_order_ptr + source_row * payload_cols + col,
+        mask=valid_row & (col < payload_cols),
+        other=0,
+    )
+    tl.store(
+        sorted_payload_ptr + sorted_row * payload_cols + col,
+        payload,
+        mask=col < payload_cols,
+    )

@@ -9,6 +9,7 @@ from aiter.ops.triton._triton_kernels.activation import (
 )
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_dynamic_mxfp4_quant_moe_sort_kernel,
+    _mixed_ck_gemm1_to_flydsl_gemm2_payload_kernel,
     _fused_flatten_mxfp4_quant,
     _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
     _fused_reduce_rms_mxfp4_quant_kernel,
@@ -18,6 +19,34 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
 
 _LOGGER = AiterTritonLogger()
+
+
+def mixed_ck_gemm1_to_flydsl_gemm2_payload_triton(
+    route_order_packed: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    *,
+    token_num: int,
+    topk: int,
+) -> torch.Tensor:
+    payload_cols = route_order_packed.shape[1]
+    route_order_u8 = route_order_packed.view(torch.uint8)
+    sorted_payload = torch.zeros(
+        (sorted_ids.shape[0], payload_cols),
+        dtype=torch.uint8,
+        device=route_order_packed.device,
+    )
+    block_n = min(256, triton.next_power_of_2(payload_cols))
+    grid = (sorted_ids.shape[0], triton.cdiv(payload_cols, block_n))
+    _mixed_ck_gemm1_to_flydsl_gemm2_payload_kernel[grid](
+        route_order_u8,
+        sorted_ids,
+        sorted_payload,
+        payload_cols=payload_cols,
+        token_num=token_num,
+        topk=topk,
+        BLOCK_N=block_n,
+    )
+    return sorted_payload
 
 
 def fused_rms_mxfp4_quant(

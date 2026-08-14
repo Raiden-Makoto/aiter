@@ -43,10 +43,18 @@ def _get_compiled_mxfp4_gemm2_port(
     BN=256,
     BK=256,
     xcd_swizzle=0,
+    group_n=1,
 ):
-    from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
+    if group_n == 2:
+        from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port_gn2
 
-    return compile_gemm2_a4w4_port(
+        compiler = compile_gemm2_a4w4_port_gn2
+    else:
+        from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
+
+        compiler = compile_gemm2_a4w4_port
+
+    return compiler(
         BM=BM,
         use_nt=use_nt,
         NE=NE,
@@ -76,6 +84,8 @@ def _assert_supported(
     atomic,
     mxfp4out,
     cshuffle=False,
+    group_n=1,
+    D_INTER_REAL=None,
     BN=256,
     BK=256,
 ):
@@ -92,6 +102,23 @@ def _assert_supported(
             f"got H={D_HIDDEN}"
         )
     epilog = _epilog_of(atomic, mxfp4out, cshuffle)
+    if group_n not in (1, 2):
+        raise NotImplementedError(f"flydsl mxfp4 gemm2 unsupported group_n={group_n}")
+    if group_n == 2 and (
+        NE != 257
+        or D_HIDDEN != 6144
+        or D_INTER != 512
+        or D_INTER_REAL not in (None, 512)
+        or BM != 128
+        or BN != 256
+        or BK != 256
+        or use_nt
+        or epilog != "nonatomic"
+    ):
+        raise NotImplementedError(
+            "flydsl mxfp4 gemm2 GN2 is restricted to gfx950 GLM "
+            "E257/H6144/I512/BM128/BN256/BK256 plain BF16 nonatomic"
+        )
     if (BM, use_nt, epilog) not in _SUPPORTED:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm2 unsupported variant "
@@ -126,6 +153,7 @@ def flydsl_mxfp4_gemm2(
     BN=256,
     BK=256,
     xcd_swizzle=0,
+    group_n=1,
     stream=None,
 ):
     _assert_supported(
@@ -138,12 +166,24 @@ def flydsl_mxfp4_gemm2(
         atomic=atomic,
         mxfp4out=mxfp4out,
         cshuffle=cshuffle,
+        group_n=group_n,
+        D_INTER_REAL=D_INTER_REAL,
         BN=BN,
         BK=BK,
     )
     epilog = _epilog_of(atomic, mxfp4out, cshuffle)
     launch = _get_compiled_mxfp4_gemm2_port(
-        BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL, BN, BK, xcd_swizzle
+        BM,
+        use_nt,
+        NE,
+        D_HIDDEN,
+        epilog,
+        D_INTER,
+        D_INTER_REAL,
+        BN,
+        BK,
+        xcd_swizzle,
+        group_n,
     )
 
     max_m_blocks = (max_sorted + BM - 1) // BM

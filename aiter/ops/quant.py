@@ -1149,6 +1149,38 @@ def fused_dynamic_mx_quant_moe_sort(
     return out, scale
 
 
+def mixed_ck_gemm1_to_flydsl_gemm2_payload(
+    route_order_packed: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    *,
+    token_num: int,
+    topk: int,
+) -> torch.Tensor:
+    """Sort CK GEMM1's route-order MXFP4 payload for FlyDSL GEMM2.
+
+    ``sorted_ids`` encodes the token in bits 0..23 and route slot in bits
+    24..31. Padding rows encode ``token_num`` and are explicitly zeroed.
+    Scale sorting is intentionally not done here: the companion scale returned
+    by ``fused_dynamic_mxfp4_quant_moe_sort`` is already sorted and swizzled for
+    the MXFP4 GEMM port.
+    """
+    assert route_order_packed.dim() == 2 and route_order_packed.is_contiguous()
+    assert sorted_ids.dim() == 1
+    assert route_order_packed.shape[0] == token_num * topk
+    assert route_order_packed.element_size() == 1
+
+    from aiter.ops.triton.quant.fused_mxfp4_quant import (
+        mixed_ck_gemm1_to_flydsl_gemm2_payload_triton,
+    )
+
+    return mixed_ck_gemm1_to_flydsl_gemm2_payload_triton(
+        route_order_packed,
+        sorted_ids,
+        token_num=token_num,
+        topk=topk,
+    )
+
+
 def fused_dynamic_mxfp4_quant_moe_sort(
     input: torch.Tensor,
     sorted_ids: torch.Tensor,

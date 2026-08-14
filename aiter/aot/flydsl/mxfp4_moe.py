@@ -52,6 +52,7 @@ def _job_key(job: dict) -> tuple:
         job["D_INTER"],
         job["D_INTER_REAL"],
         job["xcd_swizzle"],
+        job["group_n"],
     )
 
 
@@ -123,6 +124,7 @@ def parse_csv(csv_path: str):
                         "D_INTER_REAL": d_inter_real,
                         "topk": topk,  # unused by the kernel; for the entry signature
                         "xcd_swizzle": p2["xcd_swizzle"],
+                        "group_n": p2["group_n"],
                     }
                 )
 
@@ -195,6 +197,7 @@ def _compile_stage2(job):
         cshuffle=epilog == "nonatomic_cshuffle",
         D_INTER_REAL=job["D_INTER_REAL"],
         xcd_swizzle=job["xcd_swizzle"],
+        group_n=job["group_n"],
         stream=0,
     )
 

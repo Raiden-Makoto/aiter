@@ -51,6 +51,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g2_kname,
 )
 from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
+from aiter.ops.quant import mixed_ck_gemm1_to_flydsl_gemm2_payload
 
 BLOCK_SIZE_M = 32
 
@@ -1440,6 +1441,7 @@ def _mxfp4_a4w4_stage2(
     device,
     use_nt=False,
     cshuffle=False,
+    group_n=1,
     inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
 ):
     _xcd2 = _parse_mxfp4_g2_kname(kernelName2).get("xcd_swizzle", 0)
@@ -1488,6 +1490,7 @@ def _mxfp4_a4w4_stage2(
                 D_INTER_REAL=inter_real,
                 topk=topk,
                 xcd_swizzle=_xcd2,
+                group_n=group_n,
             )
             # scatter_reduce fully overwrites each output row -> write the caller's
             # buffer directly (avoids a redundant (M, D_HIDDEN) D2D copy at the end).
@@ -1537,6 +1540,7 @@ def _mxfp4_a4w4_stage2(
         D_INTER_REAL=inter_real,
         topk=topk,
         xcd_swizzle=_xcd2,
+        group_n=group_n,
     )
 
     if atomic:
@@ -1681,6 +1685,7 @@ def _mxfp4_a4w4_stage2_fw(
         device=device,
         use_nt=p2["use_nt"],
         cshuffle=p2.get("cshuffle", False),
+        group_n=p2.get("group_n", 1),
         inter_real=inter_real,
     )
 
@@ -2676,6 +2681,20 @@ def fused_moe_2stages(
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    is_mixed_ck_g1_mxfp4_g2 = (
+        stage1_func is ck_moe_stage1 and stage2_func is _mxfp4_a4w4_stage2_fw
+    )
+    if is_mixed_ck_g1_mxfp4_g2:
+        g2_block_m = _parse_mxfp4_g2_kname(
+            metadata.stage2.keywords["kernelName2"]
+        )["BM"]
+        assert (
+            block_size_M == metadata.block_m == g2_block_m == 128
+        ), (
+            "mixed CK GEMM1 -> FlyDSL GEMM2 requires sort BM, CK MPerBlock, "
+            f"and GEMM2 BM to all equal 128; got sort={block_size_M}, "
+            f"ck={metadata.block_m}, g2={g2_block_m}"
+        )
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
             extra_stage1_args["bias1"] = _normalize_bias_for_kernel(bias1)
@@ -2795,7 +2814,19 @@ def fused_moe_2stages(
             num_rows=num_local_tokens,
             sorted_weights=sorted_weights,
         )
-        a2 = a2.view(token_num, topk, -1)
+        if is_mixed_ck_g1_mxfp4_g2:
+            assert a2.shape == (token_num * topk, inter_dim // 2)
+            assert sorted_ids.shape[0] % block_size_M == 0
+            a2 = mixed_ck_gemm1_to_flydsl_gemm2_payload(
+                a2,
+                sorted_ids,
+                token_num=token_num,
+                topk=topk,
+            )
+            assert a2.shape == (sorted_ids.shape[0], inter_dim // 2)
+            assert a2_scale.shape[0] >= sorted_ids.shape[0]
+        else:
+            a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         a2_v = a2[:token_num, :, :]
         a2_scale = (

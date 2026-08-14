@@ -321,6 +321,436 @@ def compile_gemm2_a4w4_port(
     return launch_gemm2
 
 
+def compile_gemm2_a4w4_port_gn2(
+    BM=128,
+    use_nt=False,
+    *,
+    NE,
+    N_OUT,
+    epilog="nonatomic",
+    D_INTER,
+    D_INTER_REAL=None,
+    BN=256,
+    BK=256,
+    xcd_swizzle=0,
+):
+    """GLM gfx950 specialization: one persistent work item emits two N tiles."""
+    assert (
+        NE == 257
+        and N_OUT == 6144
+        and D_INTER == 512
+        and D_INTER_REAL in (None, 512)
+        and BM == 128
+        and BN == 256
+        and BK == 256
+        and not use_nt
+        and epilog == "nonatomic"
+    ), "GN2 only supports E257/H6144/I512/BM128/BN256/BK256 BF16 nonatomic"
+
+    KH_TILE = BK // 2
+    _K_HALF = k_half_for(D_INTER)
+    _slot_bytes = saq_slot_bytes(BM, KH_TILE)
+    _lds_bytes = kStages * _slot_bytes
+    _num_n_groups = num_n_blocks_for(N_OUT, BN) // 2
+    assert _num_n_groups == 12
+    _, _rows_per_wave, _kSubBlocks = tiling(BM)
+    _tag = f"ne{NE}_h{N_OUT}_i{D_INTER}_bm{BM}_nonatomic"
+    if xcd_swizzle > 0:
+        _tag += f"_xcd{xcd_swizzle}"
+    _name = f"gemm2_a4w4_port_{_tag}_gn2"
+
+    @fx.struct
+    class SharedStorage:
+        raw: fx.Array[fx.Uint8, _lds_bytes, 16]
+
+    @flyc.kernel(name=_name, known_block_size=[256, 1, 1])
+    def gemm2_kernel_gn2(
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_stids: fx.Int64,
+        arg_sweights: fx.Int64,
+        i32_M: fx.Int32,
+        i32_max_m_blocks: fx.Int32,
+        arg_out: fx.Int64,
+        arg_out_scale: fx.Int64,
+    ):
+        tx_i32 = fx.Int32(gpu.thread_id("x"))
+        bx_i32 = fx.Int32(gpu.block_id("x"))
+        lane = tx_i32 % fx.Int32(64)
+        wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
+
+        aq_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(
+            BM * _K_HALF
+        )
+        aq_rsrc = _buffer_rsrc(arg_aq, aq_num)
+        lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
+        saq_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
+
+        def _issue_all_a_loads(m_row0):
+            for kt in range_constexpr(kStages):
+                for sub in range_constexpr(_kSubBlocks):
+                    lds_row = wave * fx.Int32(_rows_per_wave) + fx.Int32(sub * 8)
+                    car = m_row0 + lds_row + (lane // fx.Int32(8))
+                    _issue_a_load_lds(
+                        aq_rsrc,
+                        saq_base_i32,
+                        kt,
+                        kt,
+                        car,
+                        lane,
+                        _slot_bytes,
+                        lds_row,
+                        KH_TILE=KH_TILE,
+                        k_half=_K_HALF,
+                    )
+
+        def _run_group(group_i32):
+            _gemm2_body_gn2(
+                lds_raw_ptr,
+                arg_ascale,
+                arg_bq,
+                arg_bscale,
+                arg_eids,
+                i32_max_m_blocks,
+                arg_out,
+                group_i32,
+                lane,
+                wave,
+            )
+
+        cumsum0 = llvm.load(T.i32, _global_ptr1(arg_cumsum, fx.Int32(0)))
+        total_m_blocks = _udiv(cumsum0, BM)
+        bound = total_m_blocks * fx.Int32(_num_n_groups)
+        grid_nb = fx.Int32(gpu.grid_dim.x)
+
+        _NXCD = 8
+        _xq = _udiv(bound, _NXCD)
+        _xr = _umod(bound, _NXCD)
+        _SW = xcd_swizzle
+
+        def _xcd(pid):
+            xc = _umod(pid, _NXCD)
+            wgid = (
+                xc * _xq
+                + fx.Int32(arith.minsi(_raw(xc), _raw(_xr)))
+                + _udiv(pid, _NXCD)
+            )
+            if const_expr(_SW <= 0):
+                return wgid
+            ng = fx.Int32(_SW * _num_n_groups)
+            group_id = wgid // ng
+            first_pid_m = group_id * fx.Int32(_SW)
+            remaining_m = total_m_blocks - first_pid_m
+            group_size_m = fx.Int32(
+                arith.minsi(_raw(remaining_m), _raw(fx.Int32(_SW)))
+            )
+            wig = wgid % ng
+            m_block = first_pid_m + (wig % group_size_m)
+            n_group = wig // group_size_m
+            return m_block * fx.Int32(_num_n_groups) + n_group
+
+        if bx_i32 < bound:
+            group = _xcd(bx_i32)
+            _issue_all_a_loads(_udiv(group, _num_n_groups) * fx.Int32(BM))
+            rocdl.sched_barrier(0)
+            _run_group(group)
+
+        for iv in range(bx_i32 + grid_nb, bound, gpu.grid_dim.x):
+            wu = fx.Int32(iv)
+            gpu.barrier()
+            group = _xcd(wu)
+            _issue_all_a_loads(_udiv(group, _num_n_groups) * fx.Int32(BM))
+            _run_group(group)
+
+    @flyc.jit
+    def launch_gemm2_gn2(
+        arg_aq: fx.Int64,
+        arg_ascale: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_stids: fx.Int64,
+        arg_sweights: fx.Int64,
+        i32_M: fx.Int32,
+        i32_max_m_blocks: fx.Int32,
+        arg_out: fx.Int64,
+        arg_out_scale: fx.Int64,
+        stream: fx.Stream,
+    ):
+        bound = i32_max_m_blocks * fx.Int32(_num_n_groups)
+        grid_i32 = fx.Int32(arith.minsi(_raw(bound), _raw(fx.Int32(NUM_CU))))
+        grid_x = arith.index_cast(T.index, _raw(grid_i32))
+        gemm2_kernel_gn2(
+            arg_aq,
+            arg_ascale,
+            arg_bq,
+            arg_bscale,
+            arg_eids,
+            arg_cumsum,
+            arg_stids,
+            arg_sweights,
+            i32_M,
+            i32_max_m_blocks,
+            arg_out,
+            arg_out_scale,
+        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch_gemm2_gn2
+
+
+@flyc.jit
+def _gemm2_body_gn2(
+    lds_raw_ptr,
+    arg_ascale,
+    arg_bq,
+    arg_bscale,
+    arg_eids,
+    i32_max_m_blocks,
+    arg_out,
+    group_i32,
+    lane,
+    wave,
+):
+    BM = 128
+    BN = 256
+    NE = 257
+    N_OUT = 6144
+    D_INTER = 512
+    KH_TILE = 128
+    _num_n_groups = 12
+    _kSubBlocks = tiling(BM)[2]
+    _kAS_per_chunk_dw = kas_per_chunk_dw_for(D_INTER)
+    _asc_per_mb = (BM // 32) * _kAS_per_chunk_dw * 4
+    _bq_bytes = bq_bytes_for(NE, N_OUT, D_INTER)
+    _bscale_bytes = bscale_bytes_for(NE, N_OUT, D_INTER)
+
+    m_block_idx = _udiv(group_i32, _num_n_groups)
+    n_group_idx = group_i32 - m_block_idx * fx.Int32(_num_n_groups)
+    e = llvm.load(T.i32, _global_ptr1(arg_eids, m_block_idx * fx.Int32(4)))
+    e = rocdl.readfirstlane(T.i32, e)
+    m_row = m_block_idx * fx.Int32(BM)
+
+    asc_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(
+        _asc_per_mb
+    )
+    ascale_rsrc = _buffer_rsrc(arg_ascale, asc_num)
+    bq_rsrc = _buffer_rsrc(arg_bq, fx.Index(_bq_bytes))
+    bscale_rsrc = _buffer_rsrc(arg_bscale, fx.Index(_bscale_bytes))
+    saq_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
+    lane_div_16 = lane // fx.Int32(16)
+    lane_mod_16 = lane % fx.Int32(16)
+    v_voff_scale = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
+
+    chunk_base = m_row // fx.Int32(32)
+    a_scale_s_base = [
+        rocdl.readfirstlane(
+            T.i32,
+            (chunk_base + fx.Int32(sub)) * fx.Int32(_kAS_per_chunk_dw) * fx.Int32(4),
+        )
+        for sub in range_constexpr(_kSubBlocks)
+    ]
+
+    def load_a_scale_tile(kt):
+        out = [None] * _kSubBlocks
+        for sub in range_constexpr(_kSubBlocks):
+            out[sub] = buffer_ops.buffer_load(
+                ascale_rsrc,
+                (v_voff_scale + fx.Int32(kt * 256)) // fx.Int32(4),
+                vec_width=1,
+                dtype=T.i32,
+                soffset_bytes=a_scale_s_base[sub],
+            )
+        return out
+
+    # Shared by both physical N tiles: two K tiles x four M subblocks.
+    a_scale_v = [load_a_scale_tile(kt) for kt in range_constexpr(2)]
+
+    first_n_block = n_group_idx * fx.Int32(2)
+    _gemm2_gn2_n_tile(
+        lds_raw_ptr,
+        arg_out,
+        bq_rsrc,
+        bscale_rsrc,
+        e,
+        m_row,
+        first_n_block,
+        lane,
+        wave,
+        a_scale_v,
+    )
+    _gemm2_gn2_n_tile(
+        lds_raw_ptr,
+        arg_out,
+        bq_rsrc,
+        bscale_rsrc,
+        e,
+        m_row,
+        first_n_block + fx.Int32(1),
+        lane,
+        wave,
+        a_scale_v,
+    )
+
+
+@flyc.jit
+def _gemm2_gn2_n_tile(
+    lds_raw_ptr,
+    arg_out,
+    bq_rsrc,
+    bscale_rsrc,
+    e,
+    m_row,
+    n_block_idx,
+    lane,
+    wave,
+    a_scale_v,
+):
+    BM = 128
+    BN = 256
+    N_OUT = 6144
+    D_INTER = 512
+    KH_TILE = 128
+    _kMChunks = kmchunks_for(BM)
+    _kSubBlocks = tiling(BM)[2]
+    _slot_bytes = saq_slot_bytes(BM, KH_TILE)
+    _K_HALF = k_half_for(D_INTER)
+    _kBS_stride_n0_dw = kbs_stride_n0_dw_for(D_INTER)
+    _kbs_per_expert_dw = kbs_per_expert_dw_for(N_OUT, D_INTER)
+    saq_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
+    lane_div_16 = lane // fx.Int32(16)
+    lane_mod_16 = lane % fx.Int32(16)
+    v_voff_scale = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
+
+    def issue_a_ds_read(slot):
+        lane_row = lane_mod_16
+        lane_col = lane_div_16 * fx.Int32(16)
+        mask = _lds_swizzle_mask(lane_row)
+        base_ptr = _lds_ptr3(saq_base_i32, fx.Int32(0))
+        a = [[None, None] for _ in range(_kMChunks)]
+        for k in range_constexpr(2):
+            lds_col = (lane_col + fx.Int32(k * 64)) ^ mask
+            for i in range_constexpr(_kMChunks):
+                lds_row = lane_row + fx.Int32(i * 16)
+                byte_off = (
+                    fx.Int32(slot * _slot_bytes)
+                    + lds_row * fx.Int32(KH_TILE)
+                    + lds_col
+                )
+                a[i][k] = llvm.load(T.vec(4, T.i32), _gep3(base_ptr, byte_off))
+        return a
+
+    b_load_s_base = []
+    for j in range_constexpr(4):
+        v = (
+            e * fx.Int32(N_OUT)
+            + n_block_idx * fx.Int32(BN)
+            + wave * fx.Int32(BN // 4)
+            + fx.Int32(j * 16)
+        ) * fx.Int32(_K_HALF)
+        b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
+
+    mni_base = (
+        n_block_idx * fx.Int32(BN // 16 // 2)
+        + wave * fx.Int32(BN // 64 // 2)
+    )
+    b_scale_s_base = []
+    for mw in range_constexpr(2):
+        v = (
+            e * fx.Int32(_kbs_per_expert_dw)
+            + (mni_base + fx.Int32(mw)) * fx.Int32(_kBS_stride_n0_dw)
+        ) * fx.Int32(4)
+        b_scale_s_base.append(rocdl.readfirstlane(T.i32, v))
+
+    def load_b_scale_tile(kt):
+        imm = kt * (kBS_stride_k0_dw * 4)
+        out = [None, None]
+        for mw in range_constexpr(2):
+            out[mw] = buffer_ops.buffer_load(
+                bscale_rsrc,
+                (v_voff_scale + fx.Int32(imm)) // fx.Int32(4),
+                vec_width=1,
+                dtype=T.i32,
+                soffset_bytes=b_scale_s_base[mw],
+            )
+        return out
+
+    def load_b_tile(kt):
+        v_voff_b = (
+            lane_div_16 * fx.Int32(256)
+            + lane_mod_16 * fx.Int32(16)
+            + fx.Int32(kt * 2048)
+        )
+        out = [[None, None] for _ in range(4)]
+        for j in range_constexpr(4):
+            for half in range_constexpr(2):
+                frag = buffer_ops.buffer_load(
+                    bq_rsrc,
+                    (v_voff_b + fx.Int32(half * 1024)) // fx.Int32(4),
+                    vec_width=4,
+                    dtype=T.i32,
+                    soffset_bytes=b_load_s_base[j],
+                )
+                out[j][half] = Vec(frag)
+        return out
+
+    # Tile-private B/scales and accumulators; epilogue follows immediately.
+    b_scale_v = [load_b_scale_tile(kt) for kt in range_constexpr(2)]
+    b = [load_b_tile(kt) for kt in range_constexpr(2)]
+    mfma_res_ty = T.f32x4
+    zero4 = Vec.filled(4, 0.0, fx.Float32)
+    accm = [[None, None, None, None] for _ in range(_kMChunks)]
+
+    for kt in range_constexpr(2):
+        gpu.barrier()
+        a = issue_a_ds_read(kt)
+        for J in range_constexpr(4):
+            mni = J // 2
+            in_b = J % 2
+            sb = b_scale_v[kt][mni]
+            b_J0 = b[kt][J][0]
+            b_J1 = b[kt][J][1]
+            for sub in range_constexpr(_kSubBlocks):
+                sa = a_scale_v[kt][sub]
+                i0 = sub * 2
+                i1 = sub * 2 + 1
+                if const_expr(kt == 0):
+                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty,
+                        [a[i0][0], b_J0, zero4, 4, 4, 0, sa, in_b, sb],
+                    )
+                    accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty,
+                        [a[i1][0], b_J0, zero4, 4, 4, 1, sa, in_b, sb],
+                    )
+                else:
+                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty,
+                        [a[i0][0], b_J0, accm[i0][J], 4, 4, 0, sa, in_b, sb],
+                    )
+                    accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        mfma_res_ty,
+                        [a[i1][0], b_J0, accm[i1][J], 4, 4, 1, sa, in_b, sb],
+                    )
+                accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    mfma_res_ty,
+                    [a[i0][1], b_J1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb],
+                )
+                accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    mfma_res_ty,
+                    [a[i1][1], b_J1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb],
+                )
+
+    out_base = _global_base_ptr1(arg_out)
+    _flat_bf16_epilog(
+        accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, BN, _kMChunks
+    )
+
+
 @flyc.jit
 def _gemm2_body(
     lds_raw_ptr,
