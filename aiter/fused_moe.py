@@ -2002,9 +2002,33 @@ def get_2stage_cfgs(
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
-    if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
+    is_mxfp4_g1 = _is_mxfp4_kname(kernelName1)
+    is_mxfp4_g2 = _is_mxfp4_kname(kernelName2)
+    is_ck_g1 = isinstance(kernelName1, str) and kernelName1.startswith(
+        "moe_ck2stages_gemm1_"
+    )
+    if is_mxfp4_g2 and is_ck_g1:
+        return MOEMetadata(
+            stage1=functools.partial(
+                ck_moe_stage1,
+                kernelName=kernelName1,
+                activation=activation,
+                quant_type=q_type,
+                dtype=dtype,
+                splitk=ksplit,
+                use_non_temporal_load=use_non_temporal_load,
+            ),
+            stage2=functools.partial(
+                _mxfp4_a4w4_stage2_fw, kernelName2=kernelName2
+            ),
+            block_m=int(block_m),
+            ksplit=int(ksplit),
+            output_aux=True,
+            prequant=True,
+        )
+    if is_mxfp4_g1 and is_mxfp4_g2:
         # gate_mode is a runtime weight-layout property, not a tuning key: route
-        # any a4w4 kernelName to the port; the bound interleave flag picks the
+        # the all-FlyDSL pair to the port; the bound interleave flag picks the
         # compiled il/sep variant at runtime.
         try:
             _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
@@ -2674,8 +2698,9 @@ def fused_moe_2stages(
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
     if m_indices is not None:
-        extra_stage1_args["m_indices"] = m_indices
-        extra_stage1_args["moe_buf"] = _sort_moe_buf
+        if stage1_func is _mxfp4_a4w4_stage1_fw:
+            extra_stage1_args["m_indices"] = m_indices
+            extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted
     _stage1_call = functools.partial(
         metadata.stage1,
