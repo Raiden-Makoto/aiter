@@ -192,6 +192,34 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     torch.testing.assert_close(torch_out, out)
 
 
+def test_batched_gemm_a16wfp4_masks_partial_k_block():
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    B, M, N, K = 1, 7, 512, 192
+    dtype = torch.bfloat16
+    x, w, _x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
+        B, M, N, K, dtype, output=True
+    )
+    expected = run_torch(x, w, w_scales, dtype)
+    config = {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 64,
+        "num_warps": 8,
+        "num_stages": 1,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": None,
+        "NUM_KSPLIT": 1,
+    }
+
+    batched_gemm_a16wfp4(x, w, w_scales, dtype, out, config=config)
+
+    torch.testing.assert_close(expected, out)
+
+
 def test_batched_gemm_a16wfp4_fake_honors_transpose_bm():
     """Regression: the fake must match the real kernel's allocation
     branch on ``transpose_bm`` (lines 100-103 of batched_gemm_a16wfp4.py).
