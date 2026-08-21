@@ -192,7 +192,8 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     torch.testing.assert_close(torch_out, out)
 
 
-def test_batched_gemm_a16wfp4_masks_partial_k_block():
+@pytest.mark.parametrize("block_size_k", [128, 256])
+def test_batched_gemm_a16wfp4_masks_partial_k_block(block_size_k):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
@@ -205,7 +206,7 @@ def test_batched_gemm_a16wfp4_masks_partial_k_block():
     config = {
         "BLOCK_SIZE_M": 256,
         "BLOCK_SIZE_N": 256,
-        "BLOCK_SIZE_K": 128,
+        "BLOCK_SIZE_K": block_size_k,
         "GROUP_SIZE_M": 64,
         "num_warps": 8,
         "num_stages": 1,
