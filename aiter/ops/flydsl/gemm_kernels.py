@@ -1058,6 +1058,8 @@ def flydsl_preshuffle_gemm_a8(
         x_scale.contiguous().view(-1),
         w_scale.contiguous().view(-1),
         _dummy_bias,
+        out_contig.view(-1),
+        out_contig.view(-1),
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),
@@ -1066,3 +1068,74 @@ def flydsl_preshuffle_gemm_a8(
         Out.copy_(out_contig)
 
     return Out
+
+
+def flydsl_preshuffle_gemm_glm52_qb(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    q_nope_fp4: Tensor,
+    q_nope_scale: Tensor,
+    q_pe: Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    use_async_copy: int = 0,
+    waves_per_eu: int = 0,
+    xcd_swizzle: int = 0,
+    lds_stage: int = 2,
+    enable_scheduler: bool = True,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Run the gfx950 GLM-5.2 q_b projection with its packed output epilogue."""
+    compile_fn = _get_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("[FlyDSL] compile function not available")
+    m, k = XQ.shape
+    n = WQ.shape[0]
+    if (n, k) != (4096, 2048):
+        raise ValueError(
+            f"expected Mx2048 @ 4096x2048, got {tuple(XQ.shape)}, "
+            f"{tuple(WQ.shape)}"
+        )
+    if n % tile_n != 0 or k % tile_k != 0:
+        raise ValueError(
+            f"selected FlyDSL tile {tile_m}x{tile_n}x{tile_k} does not fit "
+            f"M={m}, N={n}, K={k}"
+        )
+
+    exe = compile_fn(
+        N=n,
+        K=k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        in_dtype="fp8",
+        out_dtype="bf16",
+        use_async_copy=bool(use_async_copy),
+        waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
+        enable_scheduler=bool(enable_scheduler),
+        xcd_swizzle=int(xcd_swizzle),
+        lds_stage=int(lds_stage),
+        glm52_qb=True,
+    )
+    dummy_bias = torch.empty(0, dtype=torch.bfloat16, device=XQ.device)
+
+    def as_i8(t):
+        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+    _run_compiled(
+        exe,
+        q_nope_fp4.view(-1),
+        as_i8(XQ.contiguous()).view(-1),
+        as_i8(WQ.contiguous()).view(-1),
+        x_scale.contiguous().view(-1),
+        w_scale.contiguous().view(-1),
+        dummy_bias,
+        q_nope_scale,
+        q_pe.view(-1),
+        m,
+        n,
+        fx.Stream(torch.cuda.current_stream(device=XQ.device)),
+    )
+    return q_nope_fp4, q_nope_scale, q_pe

@@ -23,6 +23,8 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
 
@@ -134,10 +136,12 @@ def compile_preshuffle_gemm(
     use_async_copy: bool = False,
     xcd_swizzle: int = 0,
     lds_stage: int = 2,
+    glm52_qb: bool = False,
 ):
     """Compile preshuffle GEMM (fp8/int8/fp16/bf16).
-    Signature: fn(C, A, B, scale_a, scale_b, bias, M, N, stream). bias is the fused
-    epilogue bias (per-N, out_dtype); unused when epilogue == "none".
+    The launcher includes q_scale/q_pe pointer slots used only by ``glm52_qb``.
+    ``bias`` is the fused epilogue bias (per-N, out_dtype); unused when
+    ``epilogue == "none"``.
     """
     if in_dtype not in ("fp8", "int8", "fp16", "bf16"):
         raise ValueError(f"in_dtype must be fp8/int8/fp16/bf16, got {in_dtype!r}")
@@ -151,6 +155,18 @@ def compile_preshuffle_gemm(
         )
     if lds_stage not in (1, 2):
         raise ValueError(f"lds_stage must be 1 or 2, got {lds_stage}")
+    if glm52_qb and (
+        N != 4096
+        or K != 2048
+        or in_dtype != "fp8"
+        or out_dtype != "bf16"
+        or tile_n % 32 != 0
+    ):
+        raise ValueError(
+            "glm52_qb requires gfx950 FP8 Mx2048 @ 4096x2048, bf16 accumulation, "
+            f"and tile_n % 32 == 0; got N={N}, K={K}, {in_dtype=}, "
+            f"{out_dtype=}, {tile_n=}"
+        )
     _has_epilogue = epilogue != "none"
     _has_bias = epilogue in ("bias", "bias_relu", "bias_silu", "bias_gelu")
     _has_relu = epilogue == "bias_relu"
@@ -172,6 +188,8 @@ def compile_preshuffle_gemm(
     gpu_arch = get_rocm_arch()
     is_gfx942 = str(gpu_arch).startswith("gfx942")
     is_gfx950 = str(gpu_arch).startswith("gfx950")
+    if glm52_qb and not is_gfx950:
+        raise ValueError(f"glm52_qb is gfx950-only, got {gpu_arch}")
     use_mfma_scale_128 = is_fp8 and is_gfx950 and (tile_k % 128 == 0)
     use_mfma_k32 = is_f16_or_bf16 and is_gfx950
 
@@ -212,6 +230,11 @@ def compile_preshuffle_gemm(
         a0: fx.Array[layout_elem, a_lds_elems, 16]
         if lds_stage == 2:
             a1: fx.Array[layout_elem, a_lds_elems, 16]
+        if glm52_qb:
+            # One reduced maximum per 16-column MFMA chunk and output row.
+            # Adjacent chunks are combined after the barrier into each 32-value
+            # MXFP4 group. This avoids a global bf16 q_nope intermediate.
+            qb_amax: fx.Array[Float32, tile_m * (tile_n // 16), 16]
 
     # ── Kernel ────────────────────────────────────────────────────────
     @flyc.kernel
@@ -222,6 +245,8 @@ def compile_preshuffle_gemm(
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
         arg_bias: fx.Tensor,
+        arg_q_scale: fx.Tensor,
+        arg_q_pe: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         tiled_mma_arg: fx.TiledMma,
@@ -268,7 +293,8 @@ def compile_preshuffle_gemm(
         gC = fx.rocdl.make_buffer_tensor(
             arg_c,
             max_size=False,
-            num_records_bytes=fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(2),
+            num_records_bytes=fx.Int64(i32_m)
+            * fx.Int64(16 * 96 if glm52_qb else N * 2),
         )
 
         tA = fx.flat_divide(gA, fx.make_tile(tile_m, tile_k))[None, None, bid_x, None]
@@ -687,7 +713,153 @@ def compile_preshuffle_gemm(
             pipeline_2stage(read_stage=(num_tiles - 1) % 2, read_next=False)
 
         # ── Epilogue ─────────────────────────────────────────────
-        if const_expr(not is_8bit and not _has_epilogue):
+        if const_expr(glm52_qb):
+            acc_vec = Vec(frag_C.load())
+            qb_vals = []
+            chunk_maxima = []
+            for p in range_constexpr(acc_size):
+                ni = p // (m_repeat * 4)
+                mi = (p // 4) % m_repeat
+                ii = p % 4
+                # Match the old materialized path exactly: GEMM scales in f32,
+                # rounds to bf16, then dynamic_mxfp4_quant consumes that bf16.
+                val_bf16 = (acc_vec[p] * s_a_vals[mi][ii] * s_b_vals[ni]).to(
+                    BFloat16
+                )
+                val_q = fx.Float32(val_bf16)
+                qb_vals.append(val_q)
+                local_max = fx.math.absf(val_q)
+                for sh_dist in (1, 2, 4, 8):
+                    local_max = local_max.maximumf(
+                        local_max.shuffle_xor(fx.Int32(sh_dist), fx.Int32(16))
+                    )
+                chunk_maxima.append(local_max)
+
+            chunks_per_tile = tile_n // 16
+            amax_view = fx.make_view(
+                lds.qb_amax.ptr,
+                fx.make_layout(tile_m * chunks_per_tile, 1),
+            )
+            for p in range_constexpr(acc_size):
+                ni = p // (m_repeat * 4)
+                mi = (p // 4) % m_repeat
+                ii = p % 4
+                row_local = mi * 16 + lane_div_16 * 4 + ii
+                chunk_local = ni * num_waves + wave_id
+                if lane_mod_16 == 0:
+                    dst = fx.slice(
+                        amax_view,
+                        (None, fx.Int32(row_local * chunks_per_tile + chunk_local)),
+                    )
+                    fx.memref_store_vec(
+                        Vec.filled(1, chunk_maxima[p], Float32),
+                        dst,
+                    )
+
+            gpu.barrier()
+            q_payload_rsrc = buffer_ops.create_buffer_resource(
+                arg_c,
+                max_size=False,
+                num_records_bytes=fx.Int64(i32_m) * fx.Int64(16 * 96),
+            )
+            q_scale_rsrc = buffer_ops.create_buffer_resource(
+                arg_q_scale,
+                max_size=False,
+                num_records_bytes=fx.Int64(i32_m) * fx.Int64(16 * 6),
+            )
+            q_pe_rsrc = buffer_ops.create_buffer_resource(
+                arg_q_pe,
+                max_size=False,
+                num_records_bytes=fx.Int64(i32_m) * fx.Int64(16 * 64 * 2),
+            )
+            for p in range_constexpr(acc_size):
+                ni = p // (m_repeat * 4)
+                mi = (p // 4) % m_repeat
+                ii = p % 4
+                row = bx_m + mi * 16 + lane_div_16 * 4 + ii
+                chunk_local = ni * num_waves + wave_id
+                pair_chunk = chunk_local - (chunk_local % 2)
+                amax0 = Vec(
+                    fx.memref_load_vec(
+                        fx.slice(
+                            amax_view,
+                            (
+                                None,
+                                fx.Int32(
+                                    (mi * 16 + lane_div_16 * 4 + ii)
+                                    * chunks_per_tile
+                                    + pair_chunk
+                                ),
+                            ),
+                        )
+                    )
+                )[0]
+                amax1 = Vec(
+                    fx.memref_load_vec(
+                        fx.slice(
+                            amax_view,
+                            (
+                                None,
+                                fx.Int32(
+                                    (mi * 16 + lane_div_16 * 4 + ii)
+                                    * chunks_per_tile
+                                    + pair_chunk
+                                    + 1
+                                ),
+                            ),
+                        )
+                    )
+                )[0]
+                group_amax = fx.Float32(amax0).maximumf(fx.Float32(amax1))
+                e8m0 = fx.Int32(
+                    emit_mx_e8m0_scale(
+                        group_amax.ir_value(),
+                        mode=MxScaleRoundModeInt.Even,
+                        dtype=MxDtypeInt.FP4_E2M1,
+                    )
+                )
+                quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(
+                    Float32
+                )
+
+                global_col = by_n + chunk_local * 16 + lane_mod_16
+                head = global_col // 256
+                head_dim = global_col % 256
+                if head_dim < 192:
+                    nibble = fx.Int32(
+                        emit_f32_to_e2m1((qb_vals[p] * quant_scale).ir_value())
+                    )
+                    peer_nibble = nibble.shuffle_xor(fx.Int32(1), fx.Int32(16))
+                    if lane_mod_16 % 2 == 0:
+                        packed = (nibble | (peer_nibble << fx.Int32(4))).to(Int8)
+                        payload_offset = (
+                            (row * 16 + head) * 96 + head_dim // 2
+                        )
+                        buffer_ops.buffer_store(
+                            packed,
+                            q_payload_rsrc,
+                            fx.Int32(payload_offset),
+                            offset_is_bytes=True,
+                        )
+                    if lane_mod_16 == 0 and chunk_local % 2 == 0:
+                        scale_offset = (
+                            (head_dim // 32) * (i32_m * 16) + row * 16 + head
+                        )
+                        buffer_ops.buffer_store(
+                            e8m0.to(Int8),
+                            q_scale_rsrc,
+                            fx.Int32(scale_offset),
+                            offset_is_bytes=True,
+                        )
+                else:
+                    pe_offset = (row * 16 + head) * 64 + (head_dim - 192)
+                    buffer_ops.buffer_store(
+                        qb_vals[p].to(BFloat16),
+                        q_pe_rsrc,
+                        fx.Int32(pe_offset * 2),
+                        offset_is_bytes=True,
+                    )
+        elif const_expr(not is_8bit and not _has_epilogue):
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
             fx.copy(buf_copy_out, frag_C_retile, pC_g)
         else:
@@ -749,6 +921,8 @@ def compile_preshuffle_gemm(
         arg_scale_a: fx.Tensor,
         arg_scale_b: fx.Tensor,
         arg_bias: fx.Tensor,
+        arg_q_scale: fx.Tensor,
+        arg_q_pe: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
@@ -827,6 +1001,8 @@ def compile_preshuffle_gemm(
             arg_scale_a,
             arg_scale_b,
             arg_bias,
+            arg_q_scale,
+            arg_q_pe,
             i32_m,
             i32_n,
             tiled_mma,

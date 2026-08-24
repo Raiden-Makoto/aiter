@@ -140,21 +140,32 @@ def gemm_a8w8_bpreshuffle_cktile(
 def _parse_flydsl_kernel_name(kernel_name: str):
     """Parse a flydsl kernelName into ``(tile_m, tile_n, tile_k, async_copy,
     waves_per_eu, xcd_swizzle, lds_stage, scheduler)``, or None on failure.
-    Legacy names lacking the xcd/lds/scheduler tokens default them to
-    ``0``/``2``/``"Default"``.
+    The committed GLM-5.2 configs use the former five-number
+    ``lds,cshuffle,async,wpe,xcd`` suffix. The obsolete cshuffle selector is
+    ignored because the current kernel has one epilogue. Current four-number
+    and older two-number suffixes remain accepted.
     """
     import re
 
-    m = re.match(
-        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?(?:_([A-Za-z][A-Za-z0-9]*))?$",
+    m = re.fullmatch(
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_"
+        r"(\d+(?:x\d+){1,4})(?:_([A-Za-z][A-Za-z0-9]*))?",
         kernel_name,
     )
     if m is None:
         return None
-    tm, tn, tk, acp, wpe = (int(m.group(i)) for i in range(1, 6))
-    xcd_swizzle = int(m.group(6)) if m.group(6) else 0
-    lds_stage = int(m.group(7)) if m.group(7) else 2
-    scheduler = m.group(8) if m.group(8) else "Default"
+    tm, tn, tk = (int(m.group(i)) for i in range(1, 4))
+    params = [int(v) for v in m.group(4).split("x")]
+    scheduler = m.group(5) or "Default"
+    if len(params) == 5:
+        lds_stage, _cshuffle, acp, wpe, xcd_swizzle = params
+    elif len(params) == 4:
+        acp, wpe, xcd_swizzle, lds_stage = params
+    elif len(params) == 2:
+        acp, wpe = params
+        xcd_swizzle, lds_stage = 0, 2
+    else:
+        return None
     return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler)
 
 
@@ -785,6 +796,120 @@ def gemm_a8w8_bpreshuffle(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
             f"{dtype=}, config={config}: {e}"
         ) from e
+
+
+def gemm_a8w8_bpreshuffle_glm52_qb_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    m = XQ.shape[0]
+    return (
+        torch.empty((m, 16, 96), dtype=torch.uint8, device=XQ.device),
+        torch.empty((6, m * 16), dtype=torch.uint8, device=XQ.device)
+        .T.view(m, 16, 6),
+        torch.empty((m, 16, 64), dtype=torch.bfloat16, device=XQ.device),
+    )
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_glm52_qb_fake)
+def gemm_a8w8_bpreshuffle_glm52_qb(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """GLM-5.2 q_b producer for FP8 PTPC ``Mx2048 @ 4096x2048``.
+
+    The gfx950 FlyDSL path writes packed MXFP4 q_nope and BF16 q_pe directly
+    from the GEMM accumulators. Other backends retain a correctness fallback.
+    """
+    if (
+        XQ.dim() != 2
+        or WQ.dim() != 2
+        or XQ.shape[0] <= 0
+        or XQ.shape[1] != 2048
+        or WQ.shape != (4096, 2048)
+    ):
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle_glm52_qb requires XQ [M,2048] and "
+            f"WQ [4096,2048], got {tuple(XQ.shape)} and {tuple(WQ.shape)}"
+        )
+    if XQ.dtype != dtypes.fp8 or WQ.dtype != dtypes.fp8:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle_glm52_qb requires FP8 E4M3 inputs, "
+            f"got {XQ.dtype} and {WQ.dtype}"
+        )
+    if (
+        x_scale.dtype != torch.float32
+        or w_scale.dtype != torch.float32
+        or x_scale.numel() != XQ.shape[0]
+        or w_scale.numel() != 4096
+    ):
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle_glm52_qb requires float32 PTPC scales "
+            f"with {XQ.shape[0]} and 4096 elements, got "
+            f"{tuple(x_scale.shape)}/{x_scale.dtype} and "
+            f"{tuple(w_scale.shape)}/{w_scale.dtype}"
+        )
+    if not (XQ.device == WQ.device == x_scale.device == w_scale.device):
+        raise ValueError("all GLM-5.2 q_b inputs must be on the same device")
+
+    m = XQ.shape[0]
+    config = get_GEMM_config_with_quant_type(
+        m,
+        4096,
+        2048,
+        dtypes.fp8,
+        AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+    )
+    parsed = (
+        _parse_flydsl_kernel_name(str(config.get("kernelName", "")))
+        if config is not None and config.get("libtype") == "flydsl"
+        else None
+    )
+    if get_gfx() == "gfx950" and is_flydsl_available() and parsed is not None:
+        tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler = parsed
+        q_nope_fp4, q_nope_scale, q_pe = gemm_a8w8_bpreshuffle_glm52_qb_fake(
+            XQ, WQ, x_scale, w_scale
+        )
+        from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_glm52_qb
+
+        return flydsl_preshuffle_gemm_glm52_qb(
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            q_nope_fp4,
+            q_nope_scale,
+            q_pe,
+            tm,
+            tn,
+            tk,
+            acp,
+            wpe,
+            xcd_swizzle,
+            lds_stage=lds_stage,
+            enable_scheduler=str(scheduler).lower() != "off",
+        )
+
+    # Guarded correctness path for CK/CKTile, unavailable FlyDSL, non-gfx950,
+    # or a future tuned FlyDSL kernel family whose layout is not understood.
+    q_bf16 = gemm_a8w8_bpreshuffle(
+        XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+    ).view(m, 16, 256)
+    q_nope_bf16, q_pe = q_bf16.split((192, 64), dim=-1)
+    from .triton.quant import dynamic_mxfp4_quant
+
+    q_nope_fp4, q_nope_scale = dynamic_mxfp4_quant(
+        q_nope_bf16.contiguous().view(m * 16, 192)
+    )
+    return (
+        q_nope_fp4.view(m, 16, 96),
+        q_nope_scale.view(m, 16, 6),
+        q_pe.contiguous(),
+    )
 
 
 def gemm_a8w8_blockscale_fake(
