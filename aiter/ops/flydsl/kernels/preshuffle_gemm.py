@@ -714,6 +714,8 @@ def compile_preshuffle_gemm(
 
         # ── Epilogue ─────────────────────────────────────────────
         if const_expr(glm52_qb):
+            if const_expr(not overlap_epi_load):
+                s_a_vals, s_b_vals, bias_vals = load_epi_operands()
             acc_vec = Vec(frag_C.load())
             qb_vals = []
             chunk_maxima = []
