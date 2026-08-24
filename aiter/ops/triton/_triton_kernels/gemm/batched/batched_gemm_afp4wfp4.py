@@ -192,8 +192,16 @@ def _batched_gemm_afp4_wfp4_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            a_scales = tl.load(a_scale_ptrs)
-            b_scales = tl.load(b_scale_ptrs)
+            current_scale_offsets = k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE) + tl.arange(
+                0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
+            )
+            scale_mask = current_scale_offsets < (2 * K) // SCALE_GROUP_SIZE
+            a_scales = tl.load(
+                a_scale_ptrs, mask=scale_mask[None, :], other=127
+            )
+            b_scales = tl.load(
+                b_scale_ptrs, mask=scale_mask[None, :], other=127
+            )
             # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.

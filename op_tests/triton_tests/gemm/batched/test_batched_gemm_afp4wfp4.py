@@ -206,3 +206,35 @@ def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):
     batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
 
     torch.testing.assert_close(torch_out, out)
+
+
+@pytest.mark.parametrize("block_size_k", [128, 256])
+def test_batched_gemm_afp4_wfp4_masks_partial_k_block(block_size_k):
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    B, M, N, K = 1, 7, 512, 192
+    dtype = torch.bfloat16
+    x, w, x_scales, w_scales, out = generate_batched_gemm_afp4wfp4_inputs(
+        B, M, N, K, dtype, output=True
+    )
+    expected = run_torch(x, w, x_scales, w_scales, dtype)
+    config = {
+        "BLOCK_SIZE_M": 256,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K": block_size_k,
+        "GROUP_SIZE_M": 64,
+        "num_warps": 8,
+        "num_stages": 1,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": None,
+        "NUM_KSPLIT": 1,
+        "SPLITK_BLOCK_SIZE": K,
+    }
+
+    batched_gemm_afp4wfp4(
+        x, w, x_scales, w_scales, dtype, out, config=config
+    )
+
+    torch.testing.assert_close(expected, out)
