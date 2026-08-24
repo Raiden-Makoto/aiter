@@ -736,10 +736,7 @@ def compile_preshuffle_gemm(
                 chunk_maxima.append(local_max)
 
             chunks_per_tile = tile_n // 16
-            amax_view = fx.make_view(
-                lds.qb_amax.ptr,
-                fx.make_layout(tile_m * chunks_per_tile, 1),
-            )
+            amax_ptr = lds.qb_amax.ptr
             for p in range_constexpr(acc_size):
                 ni = p // (m_repeat * 4)
                 mi = (p // 4) % m_repeat
@@ -747,9 +744,12 @@ def compile_preshuffle_gemm(
                 row_local = mi * 16 + lane_div_16 * 4 + ii
                 chunk_local = ni * num_waves + wave_id
                 if lane_mod_16 == 0:
-                    dst = fx.slice(
-                        amax_view,
-                        (None, fx.Int32(row_local * chunks_per_tile + chunk_local)),
+                    dst = fx.make_view(
+                        fx.add_offset(
+                            amax_ptr,
+                            fx.Int32(row_local * chunks_per_tile + chunk_local),
+                        ),
+                        fx.make_layout(1, 1),
                     )
                     fx.memref_store_vec(
                         Vec.filled(1, chunk_maxima[p], Float32),
@@ -781,25 +781,24 @@ def compile_preshuffle_gemm(
                 pair_chunk = chunk_local - (chunk_local % 2)
                 amax0 = Vec(
                     fx.memref_load_vec(
-                        fx.slice(
-                            amax_view,
-                            (
-                                None,
+                        fx.make_view(
+                            fx.add_offset(
+                                amax_ptr,
                                 fx.Int32(
                                     (mi * 16 + lane_div_16 * 4 + ii)
                                     * chunks_per_tile
                                     + pair_chunk
                                 ),
                             ),
+                            fx.make_layout(1, 1),
                         )
                     )
                 )[0]
                 amax1 = Vec(
                     fx.memref_load_vec(
-                        fx.slice(
-                            amax_view,
-                            (
-                                None,
+                        fx.make_view(
+                            fx.add_offset(
+                                amax_ptr,
                                 fx.Int32(
                                     (mi * 16 + lane_div_16 * 4 + ii)
                                     * chunks_per_tile
@@ -807,6 +806,7 @@ def compile_preshuffle_gemm(
                                     + 1
                                 ),
                             ),
+                            fx.make_layout(1, 1),
                         )
                     )
                 )[0]
