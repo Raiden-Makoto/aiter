@@ -830,7 +830,7 @@ def compile_preshuffle_gemm(
                         emit_f32_to_e2m1((qb_vals[p] * quant_scale).ir_value())
                     )
                     peer_nibble = nibble.shuffle_xor(fx.Int32(1), fx.Int32(16))
-                    if lane_mod_16 % 2 == 0:
+                    if lane_mod_16 % 2 == 0 and row < i32_m:
                         packed = (nibble | (peer_nibble << fx.Int32(4))).to(Int8)
                         payload_offset = (
                             (row * 16 + head) * 96 + head_dim // 2
@@ -841,7 +841,11 @@ def compile_preshuffle_gemm(
                             fx.Int32(payload_offset),
                             offset_is_bytes=True,
                         )
-                    if lane_mod_16 == 0 and chunk_local % 2 == 0:
+                    if (
+                        lane_mod_16 == 0
+                        and chunk_local % 2 == 0
+                        and row < i32_m
+                    ):
                         scale_offset = (
                             (head_dim // 32) * (i32_m * 16) + row * 16 + head
                         )
@@ -853,12 +857,13 @@ def compile_preshuffle_gemm(
                         )
                 else:
                     pe_offset = (row * 16 + head) * 64 + (head_dim - 192)
-                    buffer_ops.buffer_store(
-                        qb_vals[p].to(BFloat16),
-                        q_pe_rsrc,
-                        fx.Int32(pe_offset * 2),
-                        offset_is_bytes=True,
-                    )
+                    if row < i32_m:
+                        buffer_ops.buffer_store(
+                            qb_vals[p].to(BFloat16),
+                            q_pe_rsrc,
+                            fx.Int32(pe_offset * 2),
+                            offset_is_bytes=True,
+                        )
         elif const_expr(not is_8bit and not _has_epilogue):
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
             fx.copy(buf_copy_out, frag_C_retile, pC_g)
